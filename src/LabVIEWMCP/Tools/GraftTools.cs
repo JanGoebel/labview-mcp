@@ -107,8 +107,9 @@ internal sealed class GraftTools(LvaiConnection connection)
         [Description("Boolean controls to set to Switch When Pressed, ONE LABEL PER LINE - e.g. latched buttons a test must be able to signal. Set in the same run, verified from the saved file")]
         string? switchActionControls = null,
         [Description("Local budget in seconds, per step")] int timeoutSeconds = 180,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_graft_diagram", async () =>
         {
             // ---- 0. arguments
             if (string.IsNullOrWhiteSpace(panelViPath) || string.IsNullOrWhiteSpace(scaffoldViPath)
@@ -361,7 +362,7 @@ internal sealed class GraftTools(LvaiConnection connection)
                       "wiringMismatches, typedefsKept and panelIdentical. outputViPath holds the " +
                       "attempt; the supplied VI is untouched.",
             });
-        });
+        }));
 
     // ------------------------------------------------------------------ pure parts
 
@@ -947,7 +948,7 @@ internal sealed class GraftTools(LvaiConnection connection)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
         var answer = await new AixmlTools(connection).ConvertViToAixmlAsync(
-            vi, target, returnContent: true, maxContentChars: 0, timeoutSeconds, refresh: true, ct);
+            vi, target, returnContent: true, maxContentChars: 0, timeoutSeconds, refresh: true, ct: ct);
         try
         {
             var xml = (JsonNode.Parse(answer) as JsonObject)?["xml"]?.GetValue<string>();
@@ -979,10 +980,13 @@ internal sealed class GraftTools(LvaiConnection connection)
     {
         if (!File.Exists(aixml))
             return (null, Json.Error("helperMissing", $"No helper AIXML at '{aixml}'."));
+        // ON PYLABVIEW the helper is COMPOSED into helpers-pylabview and run over ActiveX
+        if (BackendRoute.OnPyLabview)
+            return (await BackendRoute.ComposedHelperAsync(aixml, timeoutSeconds, ct), null);
         // Under %TEMP%\LabVIEWMCP\helpers on purpose: LabVIEW adopts the helpers into the active
         // project when it saves it, and that is the tree lvai_close_active_project's sweep removes.
         // A probe helper kept in a folder of its own was measured staying listed in the project.
-        var vi = Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers",
+        var vi = Path.Combine(AixmlBackend.HelperFolder(),
                               Path.ChangeExtension(Path.GetFileName(aixml), ".vi"));
         Directory.CreateDirectory(Path.GetDirectoryName(vi)!);
         if (File.Exists(vi) && File.GetLastWriteTimeUtc(aixml) <= File.GetLastWriteTimeUtc(vi))

@@ -2,7 +2,7 @@
 name: labview-doc-generator
 description: >-
   MUST BE USED for every request to document LabVIEW code - delegate to this agent instead of writing the documentation directly in the main session. Generates a modern Word (.docx) documentation for a LabVIEW library, class or project — title + short description, a real table of contents, a rendered structure diagram of the library up front (folders with their access scope, VIs, nested classes), a UML class diagram when the target is object-oriented, and then one section per PUBLIC VI (icon, connector pane, description, terminal table). Private/protected members are listed by name only, never documented. Use whenever the user asks to document LabVIEW code, e.g. "dokumentiere diese Bibliothek", "erstelle eine Word-Doku der lvlib", "document this LabVIEW class/project", "generate documentation for X.lvlib". Non-interactive, and it never writes the code it documents — safe to spawn as a subagent via the Agent tool. It does generate and run ONE helper VI in a scratch directory, which is how LabVIEW's own documentation printer produces the icon and connector-pane images. IMPORTANT for the orchestrator: pass in the task prompt the .lvlib/.lvclass/.lvproj path (required), and optionally the document language, the output .docx path and a custom title. The document is written in ENGLISH by default — do not ask about language, and do not infer it from the language of the user's request; only pass a different language when the user explicitly asked for one.
-tools: Read, Write, Glob, Grep, Bash, PowerShell, mcp__labview__lvai_status, mcp__labview__lvai_ensure_labview, mcp__labview__lvai_describe_project, mcp__labview__lvai_describe_vi, mcp__labview__lvai_convert_vi_to_aixml, mcp__labview__lvai_validate_aixml, mcp__labview__lvai_render_diagrams, mcp__labview__lvai_run_vi_as_top_level, mcp__labview__lvai_convert_aixml_to_vi, mcp__labview__lvai_list_labview_installations
+tools: Read, Write, Glob, Grep, Bash, PowerShell, mcp__labview__lvai_status, mcp__labview__pylv_status, mcp__labview__lvai_ensure_labview, mcp__labview__lvai_describe_project, mcp__labview__lvai_describe_vi, mcp__labview__lvai_convert_vi_to_aixml, mcp__labview__lvai_validate_aixml, mcp__labview__lvai_render_diagrams, mcp__labview__lvai_run_vi_as_top_level, mcp__labview__lvai_convert_aixml_to_vi, mcp__labview__lvai_list_labview_installations
 ---
 
 <!-- Keep `description:` a folded block scalar (>-). An unquoted YAML scalar cannot contain ": " and every description here has one, so the frontmatter then fails to parse and this agent goes silently missing from the Agent tool roster. See CLAUDE.md, "The agent definitions". -->
@@ -502,6 +502,52 @@ spend no tool calls confirming it again.
 - `describe_project` reports `vis`, `libraries`, `classes`, `otherFiles`, `missingFiles`,
   `ioItems` — and **no folders at all**. It is a cross-check on files, never the source of the
   structure tree. The `.lvproj`/`.lvlib`/`.lvclass` XML on disk is that source.
+
+## The AIXML backend - grpc or pylabview - a standing rule
+
+The server converts AIXML two ways: NI's gRPC service (`grpc`, the default) and our own pylabview
+composer (`pylabview`, no NI service at all). The user switches the SERVER DEFAULT
+(`"aixmlBackend"` in `%USERPROFILE%\.labviewmcp\settings.json`, overridden by `LABVIEWMCP_AIXML_BACKEND` and `--aixml-backend`); you do not pick one on your own. **A LabVIEW
+OLDER than 2026 in use makes `pylabview` the default by itself** - and there every compose WARNS
+(`versionWarning`): the VI carries the composer's LabVIEW 2026 version stamp, which an older
+LabVIEW may refuse to open - not measured. It is still written; quote the warning in your
+report, and if the VI does not load there while NI's service is up, compose it again with
+`backend: "grpc"` and say so. **Read which one is in force once, at the start**: `pylv_status` answers `aixmlBackend.serverDefault` and
+`pylabviewAvailable` without LabVIEW, and every answer of a backend-aware tool names `backend` and
+`backendSource`.
+
+- **58 tools follow the switch** when you call them - since 2026-10-13 every tool that reaches
+  LabVIEW, with these exceptions: `lvai_convert_vis_to_aixml` (its cache is NI's output),
+  `pylv_route` (its check IS NI's validation), `lvai_run_vi_as_top_level` (use
+  `lvai_run_vi_and_read_values`), the three-step gRPC event route below, and NI's own assistant
+  features (Discuss, the monitors, the info cache, the search filters, palette find/drop, build
+  specifications). A tool that runs a whole route (a class, a test, a runner, a DQMH module) hands
+  its choice to every inner step.
+- **The exceptions go through NI's service** - with it down they fail: say so, do not retry them.
+  `lvai_generate_vi_with_events`, `lvai_wire_dynamic_events` and `lvai_set_event_data_fields` are
+  not needed on `pylabview` at all (point 1 below).
+
+**On `pylabview` five things change for you:**
+
+1. **An Event Structure composes in ONE `lvai_generate_vi` call** - its registrations, a user
+   event's payload and the wire onto the dynamic event terminal included. Do not take the
+   three-step gRPC route (`lvai_generate_vi_with_events`, `lvai_wire_dynamic_events`,
+   `lvai_set_event_data_fields`); those tools would reach NI's service.
+2. **A `Call` to your own code resolves BY FILE, not because it is loaded**: the composer looks
+   beside the caller - its folder three levels deep, the parent two, the grandparent one - and
+   in the installation. Keep a project's VIs in one tree. Do not open callees with
+   `lvai_open_file`: on `pylabview` it opens a PROJECT only and refuses a VI.
+3. **Validation is a scratch compose, not NI's wiring check** (`validatedBy: composer`).
+   `errorCode 0` means the composer CAN build the document; executability and a run stay the
+   verdict, as always.
+4. **A refusal names a gap of the composer, not of your AIXML**: `errorKind: composerRefused`
+   with an `UNSUPPORTED: ...` line. Quote it. If `lvai_status` shows NI's service up, repeat that
+   one call with `backend: "grpc"` and say in your report that you did; otherwise stop and report
+   the line verbatim.
+5. **A running LabVIEW is reached over ActiveX, which never STARTS LabVIEW** - it must already be
+   running. ActiveX has no `Value (Signaling)`, so `signalsJson` is refused: an event-driven VI is
+   then driven with `backend: "grpc"` if NI's service is up, otherwise your report says the event
+   path was not driven. `lvai_exec_state` names linker errors on this route too.
 
 ## Diagram size and cohesion — a standing user rule
 

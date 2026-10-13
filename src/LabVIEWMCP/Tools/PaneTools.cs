@@ -55,6 +55,11 @@ internal sealed class PaneTools(LvaiConnection connection)
         put two inputs on the output edge in a VI that validated and ran.
         A pattern with no measured geometry says so instead of guessing: `Pattern` is read-only in VI
         Server, so a pattern can only be observed on a VI that already uses it.
+        ON THE pylabview BACKEND, with viPath, nothing reaches LabVIEW or NI's service: the pattern
+        is read from the FILE (scripts/pylv-conpane.py), the terminals from our reader's export
+        (vi2aixml.py), and the slot positions from the measured pattern table - the same answer
+        and the same verdict, with the table's majority orientation standing in for the probe's
+        measurement. A viPath answer names `backend` and `backendSource` on its last line.
         """)]
     public async Task<string> ConnectorPaneAsync(
         [Description("Absolute path to the .vi to measure. Omit to ask about a pattern instead")]
@@ -77,13 +82,27 @@ internal sealed class PaneTools(LvaiConnection connection)
         [Description("Regenerate the helper VI even when it already exists")]
         bool regenerateHelper = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
-        CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
-        {
-            if (viPath is null) return pattern is { } id ? DescribePattern(id) : DescribeAll();
-            return (await MeasureViAsync(viPath, helperViPath, helperAixmlPath, regenerateHelper,
-                                         timeoutSeconds, ct: ct)).Text;
-        });
+        [Description(AixmlBackend.ParameterDescription + """
+             Only viPath reaches either: a pattern or the full list needs no LabVIEW and no
+            backend. On pylabview the helper arguments are not used - there is no helper.
+            """)]
+        string? backend = null,
+        CancellationToken ct = default)
+    {
+        // A pattern lookup and the full list read a table; no backend runs, so none is named.
+        if (viPath is null)
+            return await Rpc.GuardAsync(() =>
+                Task.FromResult(pattern is { } id ? DescribePattern(id) : DescribeAll()));
+
+        if (!AixmlBackend.TryResolve(backend, "lvai_connector_pane", out var choice, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
+
+        return AixmlBackend.Named(await Rpc.GuardAsync(async () =>
+            choice.Name == AixmlBackend.PyLabview
+                ? (await MeasureFromFileAsync(viPath, timeoutSeconds, ct)).Text
+                : (await MeasureViAsync(viPath, helperViPath, helperAixmlPath, regenerateHelper,
+                                        timeoutSeconds, ct: ct)).Text), choice);
+    }
 
     /// <summary>
     /// A measured pane, with the verdict as a NUMBER beside the prose.
@@ -175,6 +194,151 @@ internal sealed class PaneTools(LvaiConnection connection)
         }
 
     /// <summary>
+    /// The pane read from the FILE by pylabview (scripts/pylv-conpane.py) - no LabVIEW, no NI
+    /// service, so the pylabview backend's verdict. Measured 2026-10-10 on a composed VI against
+    /// this tool's own probe: same pattern (4833), 0 violations and 1 warning on both, the same
+    /// corrected assignment. A failure is reported as not measured, never as a clean pane.
+    /// </summary>
+    internal static async Task<PaneVerdict> MeasureWithPylabviewAsync(string viPath, int timeoutSeconds,
+                                                                     CancellationToken ct)
+    {
+        static PaneVerdict NotMeasured(string why, string viPath) =>
+            new(Json.Error("paneNotMeasured", why, new { viPath, via = "pylabview" }), 0, -1, 0);
+
+        if (PyLabview.Locate() is not { } bundle) return NotMeasured(PyLabview.NotProvisionedMessage(), viPath);
+        if (StatusTools.ScriptsDirectory() is not { } scripts
+            || !File.Exists(Path.Combine(scripts, "pylv-conpane.py")))
+            return NotMeasured("scripts\\pylv-conpane.py was not found next to the server.", viPath);
+
+        var scratch = Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "pane-read", Path.GetRandomFileName());
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var main = Path.Combine(scratch, "m.xml");
+            var extract = await PyLabview.RunAsync(bundle, bundle.ReadRsrcPy,
+                ["-x", "-i", Path.GetFullPath(viPath), "-m", main], timeoutSeconds, ct);
+            if (extract.ExitCode != 0 || !File.Exists(main))
+                return NotMeasured("pylabview could not read the VI: " + extract.StdErr.Trim(), viPath);
+
+            var show = await PyLabview.RunAsync(bundle, Path.Combine(scripts, "pylv-conpane.py"),
+                [scratch, "--show"], timeoutSeconds, ct);
+
+            // NO PANE AT ALL is a reading, not a failure: the composer writes a connector pane
+            // only when some terminal has a conIdx, where NI's converter stamps the station default
+            // with nothing assigned. Either way a caller can wire nothing. Measured 2026-10-10 on a
+            // test document with no conIdx: `no <cons> array in the front-panel heap`.
+            if (show.StdErr.Contains("no <cons> array", StringComparison.Ordinal))
+                return new PaneVerdict(
+                    "This VI has NO connector pane: no terminal in its AIXML has a conIdx, and the " +
+                    "pylabview composer writes a pane only for assigned terminals. A caller can wire " +
+                    "nothing to it - give the terminals conIdx values if it is meant to be a subVI.",
+                    0, 0, 0);
+
+            var text = show.StdOut;
+            var pattern = System.Text.RegularExpressions.Regex.Match(text, @"connector pane pattern (\d+)");
+            if (show.ExitCode != 0 || !pattern.Success)
+                return NotMeasured("pylv-conpane.py gave no verdict: " + (show.StdErr + show.StdOut).Trim(), viPath);
+
+            var lines = text.Split('\n').Select(l => l.Trim()).ToList();
+            return new PaneVerdict(text.TrimEnd(), int.Parse(pattern.Groups[1].Value),
+                                   lines.Count(l => l.StartsWith("[violation]", StringComparison.Ordinal)),
+                                   lines.Count(l => l.StartsWith("[warning]", StringComparison.Ordinal)));
+        }
+        finally
+        {
+            try { Directory.Delete(scratch, recursive: true); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
+    /// lvai_connector_pane's viPath answer on the pylabview backend - no LabVIEW, no NI service -
+    /// in the SAME shape as the probe's. Three readings joined, each from the one place that has
+    /// it without LabVIEW:
+    ///   - the PATTERN, read from the file by <see cref="MeasureWithPylabviewAsync"/> - the route
+    ///     lvai_generate_vi's pane step takes on pylabview, reused as it stands, including its
+    ///     reading of a VI that has no pane at all;
+    ///   - the TERMINALS and their conIdx, from our reader's export (vi2aixml.py), parsed exactly
+    ///     as the probe route parses NI's (<see cref="PaneTerminals"/>);
+    ///   - the SLOT POSITIONS, from the measured pattern table, where the probe measures the VI's
+    ///     own `Terminal Bounds[]` - the one reading that is not this VI's, and the answer says so.
+    /// The verdict is then RenderVerdict over that geometry - the probe route's own code. Should
+    /// the reader or the table fail, pylv-conpane.py's verdict is
+    /// the answer, as it is inside lvai_generate_vi.
+    /// </summary>
+    internal static async Task<PaneVerdict> MeasureFromFileAsync(string viPath, int timeoutSeconds,
+                                                                 CancellationToken ct)
+    {
+        if (!File.Exists(viPath))
+            throw new FileNotFoundException($"No VI at '{viPath}'.", viPath);
+
+        var fromScript = await MeasureWithPylabviewAsync(viPath, timeoutSeconds, ct);
+        if (!fromScript.Measured || fromScript.Pattern == 0) return fromScript;
+
+        static PaneVerdict ScriptOnly(PaneVerdict verdict, string why) =>
+            verdict with
+            {
+                Text = verdict.Text + Environment.NewLine + Environment.NewLine +
+                       "This is pylv-conpane.py's own verdict, read from the file: " + why,
+            };
+
+        if (ConnectorPanePatterns.Find(fromScript.Pattern)?.Geometry is not { } geometry)
+            return ScriptOnly(fromScript,
+                $"the pattern table has no slot geometry for {fromScript.Pattern}.");
+
+        var (terminals, problem) = await ReaderTerminalsAsync(viPath, timeoutSeconds, ct);
+        if (terminals is null)
+            return ScriptOnly(fromScript, "the reader could not list the terminals - " + problem);
+
+        var row = ConnectorPanePatterns.Find(fromScript.Pattern)!;
+        var verdict = RenderVerdict(Path.GetFullPath(viPath), geometry, terminals,
+            "SLOT MAP - conIdx by position, from the MEASURED PATTERN TABLE: the pattern was " +
+            "read from the file (pylv-conpane.py), the terminals from the reader's export " +
+            "(vi2aixml.py), and no LabVIEW was asked." +
+            (row.OrientationVaries
+                ? $" CAUTION: pattern {row.Pattern} was found in {row.Variants} orientations, and " +
+                  "the table holds the majority one - the probe (backend grpc) measures this VI's own."
+                : ""));
+
+        // Two readings of one file - pylv-conpane.py's and the reader's - must agree. They were
+        // proven identical on two panes; a disagreement is worth a line, never a silent pick.
+        if (verdict.Measured &&
+            (verdict.Violations != fromScript.Violations || verdict.Warnings != fromScript.Warnings))
+            verdict = verdict with
+            {
+                Text = verdict.Text + Environment.NewLine + Environment.NewLine +
+                       $"NOTE: pylv-conpane.py, reading the same file, counts {fromScript.Violations} " +
+                       $"violation(s) and {fromScript.Warnings} warning(s) where this verdict counts " +
+                       $"{verdict.Violations} and {verdict.Warnings}. Its own answer:" +
+                       Environment.NewLine + fromScript.Text,
+            };
+        return verdict;
+    }
+
+    /// <summary>The pane terminals out of our reader's export of <paramref name="viPath"/>.</summary>
+    private static async Task<(IReadOnlyList<ConnectorPane.Terminal>? Terminals, string? Problem)>
+        ReaderTerminalsAsync(string viPath, int timeoutSeconds, CancellationToken ct)
+    {
+        if (AixmlComposer.Locate(out var missing) is not { } setup) return (null, missing);
+
+        var scratch = Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "pane-read",
+                                   $"terminals-{Guid.NewGuid():N}.xml");
+        try
+        {
+            var read = await AixmlComposer.ReadAsync(setup, viPath, scratch, timeoutSeconds, ct);
+            if (!read.Written) return (null, read.Message);
+            return ViTerminals.Parse(await File.ReadAllTextAsync(scratch, ct)) is { } parsed
+                ? (PaneTerminals(parsed), null)
+                : (null, "its export is not readable AIXML");
+        }
+        finally
+        {
+            try { if (File.Exists(scratch)) File.Delete(scratch); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+    }
+
+    /// <summary>
     /// Does the probe's pane lack a slot the export assigns? Only then are the two readings of
     /// different VIs; an unparsable bounds payload is left to <see cref="RenderVerdict"/>, which
     /// names that failure itself.
@@ -235,19 +399,24 @@ internal sealed class PaneTools(LvaiConnection connection)
             if (response.ErrorCode != 0 || !File.Exists(scratch)) return [];
 
             var parsed = ViTerminals.Parse(await File.ReadAllTextAsync(scratch, ct));
-            if (parsed is null) return [];
-
-            return parsed.Inputs.Where(t => t.ConIdx is not null)
-                .Select(t => new ConnectorPane.Terminal(t.Name, false, t.ConIdx!.Value))
-                .Concat(parsed.Outputs.Where(t => t.ConIdx is not null)
-                    .Select(t => new ConnectorPane.Terminal(t.Name, true, t.ConIdx!.Value)))
-                .ToList();
+            return parsed is null ? [] : PaneTerminals(parsed);
         }
         finally
         {
             try { if (File.Exists(scratch)) File.Delete(scratch); } catch (IOException) { }
         }
     }
+
+    /// <summary>
+    /// The terminals of an export that sit on the pane - those with a conIdx - whichever converter
+    /// wrote the export.
+    /// </summary>
+    internal static IReadOnlyList<ConnectorPane.Terminal> PaneTerminals(ViTerminals.Result parsed) =>
+        parsed.Inputs.Where(t => t.ConIdx is not null)
+            .Select(t => new ConnectorPane.Terminal(t.Name, false, t.ConIdx!.Value))
+            .Concat(parsed.Outputs.Where(t => t.ConIdx is not null)
+                .Select(t => new ConnectorPane.Terminal(t.Name, true, t.ConIdx!.Value)))
+            .ToList();
 
     // ---------------------------------------------------------------- rendering
 
@@ -273,12 +442,27 @@ internal sealed class PaneTools(LvaiConnection connection)
                 "The helper returned a Terminal Bounds[] payload this build cannot read.",
                 new { viPath, pattern }), pattern, -1, 0);
 
+        return RenderVerdict(viPath, geometry, terminals);
+    }
+
+    /// <summary>
+    /// The verdict over a pane whose slot geometry is already in hand - measured by the probe, or
+    /// taken from the pattern table on the pylabview backend. <paramref name="slotMapSource"/>
+    /// says which, when it is not the probe's measurement.
+    /// </summary>
+    internal static PaneVerdict RenderVerdict(
+        string viPath, ConnectorPane.Geometry geometry,
+        IReadOnlyList<ConnectorPane.Terminal> terminals, string? slotMapSource = null)
+    {
+        var pattern = geometry.Pattern;
         var sb = new StringBuilder();
         sb.AppendLine($"{Path.GetFileName(viPath)} - connector pane pattern {pattern}, " +
                       $"{geometry.Terminals} terminals in columns {geometry.ColumnProfile}, " +
                       $"{terminals.Count} of them assigned.");
         sb.AppendLine();
-        sb.AppendLine("SLOT MAP - conIdx by position, as measured. A middle column that spans two");
+        sb.AppendLine(slotMapSource is null
+            ? "SLOT MAP - conIdx by position, as measured. A middle column that spans two"
+            : slotMapSource + " A middle column that spans two");
         sb.AppendLine("rows is shown in its upper row.");
         sb.AppendLine(ConnectorPane.RenderMap(geometry));
         sb.AppendLine();
@@ -552,5 +736,5 @@ internal sealed class PaneTools(LvaiConnection connection)
     /// when saving a generated VI under %LOCALAPPDATA%, while %TEMP% accepts it.
     /// </summary>
     private static string DefaultHelperViPath() =>
-        Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvpane_probe.vi");
+        Path.Combine(AixmlBackend.HelperFolder(), "lvpane_probe.vi");
 }

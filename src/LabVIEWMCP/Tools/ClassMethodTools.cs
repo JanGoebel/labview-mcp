@@ -158,6 +158,12 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
         AddItemFromMemory's 56002 (already a loose project item) and 1004 (already a member) are
         still tolerated and still reported as `memberAlreadyExisted`, gated on the .lvclass itself
         listing the VI, because 1004 is also what a wrong `Name` input produces.
+        A METHOD PASSED AS AN EXISTING `vi` IS NOT DROPPED when the VI names the class as its owner
+        (LIBN): it keeps that link, so a drop made AddItemFromMemory answer 1004 and left the class
+        file WITHOUT the entry (measured 2026-10-12). Such a method takes the tolerated path
+        (`keepExistingMembers`); one the class file no longer lists is refused (`memberOrphaned`) -
+        pass its aixml. Each terminal's Replace error and its class read back off the panel are in
+        the `retype` step, and the verify also requires the class file to list the VI.
         methodsJson is a JSON ARRAY:
           [{"aixml":"C:\\x\\Initialize.xml","vi":"C:\\cls\\Initialize.vi",
             "classTerminals":["obj in","obj out"],"dispatchTerminals":["obj in","obj out"]}]
@@ -208,8 +214,26 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
         string? helperAixmlPath = null,
         [Description("Regenerate the helper VI even when it exists")] bool regenerateHelper = false,
         [Description("Local budget in seconds, per step")] int timeoutSeconds = 300,
-        CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        CancellationToken ct = default,
+        [Description(AixmlBackend.ParameterDescription + """
+             On pylabview NO STEP touches NI's service: each method is COMPOSED from its AIXML (the
+            path stand-ins compose like any path), the pane repaired by pylabview as before, and the
+            retype-and-membership helper COMPOSED and run over LabVIEW's ActiveX server, where
+            {LV.Control} Replace, AddItemFromMemory and both saves work as in the add-on's instance.
+            A pylabview "validation" is a scratch compose, not NI's wiring check. helperViPath is
+            ignored there. LabVIEW must already be running.
+            """)]
+        string? backend = null,
+        [Description("""
+            Run LabVIEW's own Clean Up Diagram on each method once it is a verified member, and
+            save it in place (the cleanUpDiagram step). Reported, never gating: a refused clean-up
+            leaves the method as converted and still ok.
+            """)]
+        bool cleanUpDiagram = true)
+    {
+        if (!AixmlBackend.TryResolve(backend, "lvai_add_class_method", out var choice, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
+        return AixmlTools.WithBackend(await Rpc.GuardAsync(async () =>
         {
             if (!File.Exists(lvclassPath))
                 return Json.Error("badArguments", $"No .lvclass at '{lvclassPath}'.");
@@ -250,12 +274,20 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                     "folder lvai_status reports as scriptsDirectory). Pass helperAixmlPath.");
 
             var helperVi = Path.GetFullPath(helperViPath ?? Path.Combine(
-                Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvai_add_class_method.vi"));
+                AixmlBackend.HelperFolder(), "lvai_add_class_method.vi"));
             Directory.CreateDirectory(Path.GetDirectoryName(helperVi)!);
             // NOT `!File.Exists` - see Infra/HelperCache. This site kept running the helper
             // built before the per-terminal class path was added to the AIXML, which is not an
             // error anywhere: the missing control simply keeps its default.
-            if (regenerateHelper || HelperCache.NeedsRebuild(source, helperVi))
+            if (choice.Name == AixmlBackend.PyLabview)
+            {
+                // COMPOSED and run over ActiveX: Replace, AddItemFromMemory and the saves work from
+                // LabVIEW's main instance, which is the IDE's own.
+                var (composed, problem) = await ComposedHelpers.EnsureAsync(HelperFileName, timeoutSeconds, ct);
+                if (composed is null) return Json.Error("helperNotComposable", problem!);
+                helperVi = composed;
+            }
+            else if (regenerateHelper || HelperCache.NeedsRebuild(source, helperVi))
             {
                 var built = await new BulkTools(connection).GenerateViAsync(
                     source, helperVi, openVI: false, measurePane: false, panePattern: null,
@@ -300,7 +332,57 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
             // survivable but which evidently still mutates what the following class save writes.
             // `memberAlreadyExisted` is the only input that separates the clean run from the
             // destructive one, so that is what this removes.
-            var alreadyListed = MembersAlreadyListed(classPath, methods.Select(m => m.Vi));
+            //
+            // BUT ONLY FOR A METHOD THAT IS ABOUT TO BE WRITTEN AGAIN. A method passed as an
+            // existing `vi` that already names this class as its owner (its LIBN block) keeps that
+            // link through the drop, LabVIEW loads it as a member again, and AddItemFromMemory
+            // answers 1004 against a class file that no longer lists it - the chain stops and the
+            // class file is left WITHOUT the entry. Measured 2026-10-12, a `{"vi":...}` repair
+            // re-run on a fresh class; a project close did not write the entry back. Such a method
+            // keeps its entry and takes the tolerated already-a-member path: the VI and the class
+            // agree about the membership, which is not the shape that destroyed a class on
+            // 2026-09-14 (a freshly CONVERTED file, which names no owner, under an entry the class
+            // still listed).
+            var keptMembers = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var method in methods.Where(m => m.Aixml is null))
+            {
+                var vi = Path.GetFullPath(method.Vi);
+                if (NamesClassAsOwner(await OwningLibrariesAsync(vi, timeoutSeconds, ct), classPath))
+                    keptMembers.Add(vi);
+            }
+            // AN ORPHAN - the VI names the class, the class file does not list it - is what the
+            // pre-fix drop left behind. AddItemFromMemory cannot repair it: measured 2026-10-12,
+            // twice, it answers 1004 (tolerated), every save answers 0, and the class file still
+            // does not list the VI, which stays eBad. A recompose can, so say so before touching
+            // anything.
+            var orphans = keptMembers.Where(vi => !IsAlreadyMember(classPath, vi)).ToList();
+            if (orphans.Count > 0)
+                return Json.Error("memberOrphaned",
+                    string.Join(", ", orphans.Select(Path.GetFileName)) + " names " +
+                    Path.GetFileName(classPath) + " as its owner (LIBN), and the class file does " +
+                    "not list it, so LabVIEW loads it as a member the class does not have - eBad. " +
+                    "AddItemFromMemory cannot repair that: it answers 1004 and the class save " +
+                    "writes no entry. Nothing was changed.",
+                    new
+                    {
+                        lvclassPath = classPath,
+                        orphans,
+                        hint = "Call again with the method's \"aixml\": the convert writes the VI " +
+                               "afresh with no owner and the first-run path makes it a member. " +
+                               "This state is what a `vi`-only re-run left behind before 2026-10-12.",
+                    });
+            var toRewrite = methods.Where(m => !keptMembers.Contains(Path.GetFullPath(m.Vi))).ToList();
+            var alreadyListed = MembersAlreadyListed(classPath, toRewrite.Select(m => m.Vi));
+            if (keptMembers.Count > 0)
+                prologue.Add(new JsonObject
+                {
+                    ["step"] = "keepExistingMembers",
+                    ["kept"] = new JsonArray([.. keptMembers.Select(p => (JsonNode)Path.GetFileName(p)!)]),
+                    ["why"] = "Passed as an existing `vi` that already names this class as its " +
+                              "owner (LIBN, read from the file). Dropping its class entry would " +
+                              "make AddItemFromMemory answer 1004 and leave the class file without " +
+                              "it, so the membership is treated as existing instead.",
+                });
 
             var needsConvert = methods.Any(m => m.Aixml is not null) || panePattern > 0;
 
@@ -315,7 +397,7 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
             {
                 var closed = await new CloseTools(connection).CloseActiveProjectAsync(
                     helperViPath: null, helperAixmlPath: null, regenerateHelper: false,
-                    timeoutSeconds: timeoutSeconds, ct: ct);
+                    timeoutSeconds: timeoutSeconds, ct: ct, backend: choice.Name);
                 prologue.Add(new JsonObject
                 {
                     ["order"] = ++order,
@@ -345,7 +427,7 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
 
                 // STILL CLOSED, AND THIS IS THE ONLY WINDOW IT FITS IN - editing the class file
                 // while LabVIEW holds the project open is undone by LabVIEW's own save, silently.
-                var dropped = RemoveMemberEntries(classPath, methods.Select(m => Path.GetFullPath(m.Vi)));
+                var dropped = RemoveMemberEntries(classPath, toRewrite.Select(m => Path.GetFullPath(m.Vi)));
 
                 // RemoveMemberEntries changes NOTHING when the file is not the shape it was
                 // measured against - which is right, but it would leave us walking into exactly
@@ -447,10 +529,18 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                     if (validateFirst)
                     {
                         var check = await new AixmlTools(connection).ValidateAixmlAsync(
-                            aixml, timeoutSeconds, ct: ct);
+                            aixml, timeoutSeconds, backend: choice.Name, ct: ct);
                         var message = (Read(check) as JsonObject)?["errorMessage"]?
                             .GetValue<string>() ?? "";
-                        var classWire = Code(check) != 0 && IsClassTypeComplaint(message);
+                        // A COMPOSER refusal is never the class-wire strictness: the composer does
+                        // not type-check wiring at all, it refuses what it cannot BUILD. Measured
+                        // 2026-10-12: `Sensor.lvclass lists no member 'Read Value.vi'` mentions
+                        // `.lvclass`, was waved through as strictness, and the convert then
+                        // refused the same document a second time.
+                        var composerRefused = (Read(check) as JsonObject)?["errorKind"]?
+                            .GetValue<string>() == "composerRefused";
+                        var classWire = Code(check) != 0 && !composerRefused
+                                        && IsClassTypeComplaint(message);
                         steps.Add(new JsonObject
                         {
                             ["step"] = "preValidate",
@@ -485,7 +575,8 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                     }
 
                     var convert = await new AixmlTools(connection).ConvertAixmlToViAsync(
-                        aixml, viPath, openVI: false, timeoutSeconds, checkExecutable: false, ct: ct);
+                        aixml, viPath, openVI: false, timeoutSeconds, checkExecutable: false,
+                        backend: choice.Name, ct: ct);
                     steps.Add(new JsonObject { ["step"] = "convert", ["answer"] = Read(convert) });
                     if (Code(convert) != 0 || !File.Exists(viPath))
                     {
@@ -522,7 +613,7 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                 var opened = await new ActionTools(connection).OpenFileAsync(
                     viPath: null, viName: null, projectPath: Path.GetFullPath(projectPath),
                     projectName: Path.GetFileName(projectPath),
-                    checkActive: true, timeoutSeconds, ct: ct);
+                    checkActive: true, timeoutSeconds, ct: ct, backend: choice.Name);
                 prologue.Add(new JsonObject
                 {
                     ["order"] = ++order,
@@ -545,7 +636,8 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                 var indices = method.DispatchTerminalIndices;
                 if (indices is null && method.DispatchTerminals is { Count: > 0 } names)
                 {
-                    var (resolved, note) = await ResolveConIdxAsync(viPath, names, timeoutSeconds, ct: ct);
+                    var (resolved, note) = await ResolveConIdxAsync(viPath, names, timeoutSeconds, ct: ct,
+                                                                    backend: choice.Name);
                     if (resolved is null)
                     {
                         results.Add(Failed(method, viPath, "dispatchTerminals", steps,
@@ -564,11 +656,14 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
 
                 // Asked from the FILE before the helper runs, so the helper can tell a benign
                 // re-add from a genuinely wrong Name input. Costs no LabVIEW.
-                var memberExists = IsAlreadyMember(classPath, viPath);
+                // OR the VI itself names the class: then LabVIEW loads it as a member whatever the
+                // class file says, and 1004 is the no-op it is for a listed one (keepExistingMembers).
+                var memberExists = IsAlreadyMember(classPath, viPath) || keptMembers.Contains(viPath);
                 var inputs = HelperInputs(method, viPath, classPath, indices, memberExists);
                 var run = await new RunTools(connection).RunViAndReadValuesAsync(
                     helperVi, inputs.ToJsonString(), includeRawXml: false, helperViPath: null,
-                    helperAixmlPath: null, regenerateHelper: false, timeoutSeconds, ct: ct);
+                    helperAixmlPath: null, regenerateHelper: false, timeoutSeconds,
+                    backend: choice.Name, ct: ct);
                 steps.Add(new JsonObject { ["step"] = "member", ["answer"] = Read(run) });
 
                 var values = (Read(run) as JsonObject)?["values"] as JsonObject;
@@ -581,7 +676,15 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                                      "wire rule error", "save vi error", "save class error" };
                 var failedStage = stages.FirstOrDefault(s => StageCode(values, s) is not (0 or null));
 
-                if (failedStage is not null || retyped != method.ClassTerminals.Count)
+                // PER TERMINAL, AND READ BACK - since 2026-10-12. The helper used to count names
+                // FOUND as "retyped" with the Replace's own error out unwired, so a refused Replace
+                // and a Replace that changed nothing both read `terminals retyped: 2`, error 0, and
+                // only the on-disk verify saw that one stand-in had stayed a path.
+                var retype = RetypeReport(method, values);
+                steps.Add(new JsonObject { ["step"] = "retype", ["answer"] = retype.Report });
+
+                if (failedStage is not null || retyped != method.ClassTerminals.Count
+                    || retype.StillPathInMemory.Count > 0)
                 {
                     results.Add(Failed(method, viPath, "member", steps, new JsonObject
                     {
@@ -589,9 +692,14 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                         ["terminalsWanted"] = method.ClassTerminals.Count,
                         ["failedStage"] = failedStage,
                         ["stageErrorCode"] = failedStage is null ? 0 : StageCode(values, failedStage),
+                        ["replaceErrorCodes"] = retype.Report["replaceErrorCodes"]?.DeepClone(),
+                        ["stillPathInMemory"] = new JsonArray(
+                            [.. retype.StillPathInMemory.Select(n => (JsonNode)n!)]),
                         ["terminalNamesSeen"] = new JsonArray(
                             [.. Names(values, "terminal names seen").Select(n => (JsonNode)n)]),
-                        ["hint"] = Hint(failedStage, retyped, method),
+                        ["hint"] = failedStage is null && retype.Hint is { } why
+                            ? why
+                            : Hint(failedStage, retyped, method),
                     }));
                     stoppedAt ??= "member";
                     continue;
@@ -616,7 +724,20 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                         : null;
                     evidence = await VerifyOnDiskAsync(viPath, method.ClassTerminals.Count,
                                                        genuinePaths, timeoutSeconds, ct: ct);
-                    verified = evidence["classTypedTerminals"]?.GetValue<int>()
+                    // AND THE CLASS FILE LISTS IT. A method can come out class-typed on disk and
+                    // still not be a member: measured 2026-10-12, an orphan re-run answered ok
+                    // with both terminals udClassDDO while the .lvclass named no such item and the
+                    // VI read eBad. Plain XML, no LabVIEW.
+                    var listed = IsAlreadyMember(classPath, viPath);
+                    evidence["listedInClassFile"] = listed;
+                    // REPORTED, not gated: measured source-only on both backends (2026-10-12) - the
+                    // composed or converted VI goes through pylv_apply's strip and LabVIEW's own
+                    // save keeps it so - but the rule is that it is read, not assumed.
+                    var blocks = ClassTools.CompiledBlocks(viPath);
+                    evidence["sourceOnly"] = blocks.Count == 0;
+                    evidence["compiledBlocks"] = new JsonArray([.. blocks.Select(b => (JsonNode)b!)]);
+                    verified = listed
+                               && evidence["classTypedTerminals"]?.GetValue<int>()
                                == method.ClassTerminals.Count
                                // NOT GATED when the expectation is unknown - a method handed over
                                // as an existing `vi` has no AIXML to count, and demanding 0 there
@@ -635,15 +756,29 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                     continue;
                 }
 
+                // AFTER the verify, so the file it read is the converted one; the clean-up's own
+                // save keeps the class typing, which the class save has already committed.
+                bool? cleanedUp = null;
+                if (cleanUpDiagram)
+                {
+                    var cleaned = await new DiagramCleanup(connection).RunAsync(
+                        viPath, choice.Name, timeoutSeconds, ct);
+                    steps.Add(cleaned);
+                    cleanedUp = cleaned["ok"]?.GetValue<bool>() == true
+                                && cleaned["skipped"]?.GetValue<bool>() != true;
+                }
+
                 added++;
                 results.Add(new JsonObject
                 {
                     ["method"] = Path.GetFileNameWithoutExtension(viPath),
                     ["vi"] = viPath,
                     ["ok"] = true,
+                    ["diagramCleanedUp"] = cleanedUp,
                     ["terminalsRetyped"] = retyped,
                     ["dynamicDispatchTerminals"] = new JsonArray([.. (indices ?? []).Select(i => (JsonNode)i)]),
                     ["verifiedOnDisk"] = verify,
+                    ["sourceOnly"] = ClassTools.CompiledBlocks(viPath).Count == 0,
                     ["memberAlreadyExisted"] = alreadyMember,
                     ["steps"] = steps,
                 });
@@ -668,7 +803,8 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                     : "A method that failed at `member` left the class saved and the VI a member; " +
                       "one that failed at `convert` or `conpane` never reached the class at all.",
             });
-        });
+        }), choice);
+    }
 
     // ------------------------------------------------------------------ verification
 
@@ -738,6 +874,63 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
         }
     }
 
+    /// <summary>
+    /// The owning libraries a saved VI names for itself - its <c>LIBN</c> block, read with pylabview
+    /// and no LabVIEW - or null when the file cannot be read. A class member names its class
+    /// (<c>Probe.lvclass</c>); a VI freshly composed or converted names none.
+    ///
+    /// WHY IT MATTERS HERE. Dropping a member's entry from the .lvclass turns a re-run into a first
+    /// run only when the VI is about to be WRITTEN AGAIN without that link - the `aixml` case. A
+    /// method passed as an existing `vi` keeps its LIBN, so LabVIEW loads it as a member of the
+    /// class again and AddItemFromMemory answers 1004 against a class file that no longer lists it.
+    /// Measured 2026-10-12 on a fresh class: the chain stopped at `add member error 1004` and LEFT
+    /// THE CLASS FILE WITHOUT THE ENTRY, the method an orphan naming its class - and a project
+    /// close did not write it back.
+    /// </summary>
+    internal static async Task<List<string>?> OwningLibrariesAsync(string viPath, int timeoutSeconds,
+                                                                   CancellationToken ct)
+    {
+        var bundle = PyLabview.Locate();
+        if (bundle is null || !File.Exists(viPath)) return null;
+
+        var scratch = Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "method",
+                                   Path.GetRandomFileName());
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var main = Path.Combine(scratch, "m.xml");
+            var run = await PyLabview.RunAsync(bundle, bundle.ReadRsrcPy,
+                ["-x", "-i", viPath, "-m", main], Rpc.ClampToolWait(timeoutSeconds), ct);
+            if (run.ExitCode != 0 || !File.Exists(main)) return null;
+            return OwningLibrariesFromMainXml(await File.ReadAllTextAsync(main, ct));
+        }
+        finally
+        {
+            try { Directory.Delete(scratch, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    /// <summary>The <c>&lt;Library&gt;</c> names in a pylabview main XML's LIBN block, outermost first.</summary>
+    internal static List<string> OwningLibrariesFromMainXml(string mainXml)
+    {
+        try
+        {
+            return [.. XDocument.Parse(mainXml).Descendants("LIBN")
+                .SelectMany(b => b.Descendants("Library")).Select(l => l.Value.Trim())
+                .Where(v => v.Length > 0)];
+        }
+        catch (System.Xml.XmlException) { return []; }
+    }
+
+    /// <summary>
+    /// Does the VI name this class among its owners? Any LIBN entry, not a position: a class inside
+    /// a library has not been measured, and which end of the list it sits at is not known.
+    /// </summary>
+    internal static bool NamesClassAsOwner(IReadOnlyList<string>? libraries, string classPath) =>
+        libraries is { Count: > 0 }
+        && libraries.Any(l => string.Equals(l, Path.GetFileName(classPath),
+                                            StringComparison.OrdinalIgnoreCase));
+
     private static int Count(string text, string needle)
     {
         var count = 0;
@@ -760,14 +953,18 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
     /// means opposite edges on 4815 and 4833. The export is what the file says now.
     /// </summary>
     private async Task<(List<int>? Indices, string Note)> ResolveConIdxAsync(
-        string viPath, IReadOnlyList<string> names, int timeoutSeconds, CancellationToken ct)
+        string viPath, IReadOnlyList<string> names, int timeoutSeconds, CancellationToken ct,
+        string? backend = null)
     {
+        // unset means the route's own choice - inherited when the calling tool runs on
+        // pylabview, grpc otherwise
+        backend ??= AixmlBackend.Inherited.Value?.Name ?? AixmlBackend.Grpc;
         var export = Path.Combine(Path.GetTempPath(), "LabVIEWMCP",
             Path.ChangeExtension(Path.GetFileName(viPath), ".conidx.xml"));
         Directory.CreateDirectory(Path.GetDirectoryName(export)!);
         var answer = await new AixmlTools(connection).ConvertViToAixmlAsync(
             viPath, export, returnContent: true, maxContentChars: 200000,
-            timeoutSeconds: timeoutSeconds, refresh: true, ct: ct);
+            timeoutSeconds: timeoutSeconds, refresh: true, backend: backend, ct: ct);
         if ((Read(answer) as JsonObject)?["xml"]?.GetValue<string>() is not { } xml)
             return (null, "The VI could not be exported, so a terminal NAME cannot be turned into " +
                           "a conIdx. Pass dispatchTerminalIndices instead.");
@@ -835,11 +1032,97 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
         return match.Success && int.TryParse(match.Groups[1].Value, out var code) ? code : null;
     }
 
-    private static List<string> Names(JsonObject? values, string name)
+    /// <summary>What the helper says about each terminal it was asked to retype.</summary>
+    internal sealed record Retype(JsonObject Report, List<string> StillPathInMemory, string? Hint);
+
+    /// <summary>
+    /// Each requested terminal's Replace error code and its class as the panel shows it AFTER the
+    /// loop - read back from a fresh <c>Controls[]</c>, not from the reference Replace returned.
+    ///
+    /// WHY BOTH. Measured 2026-10-12 on the pylabview backend (C:\Temp\BackendCompare): a method
+    /// answered `terminals retyped: 2` with every stage at error 0, and the SAVED file still had
+    /// `Sensor out` as a path. The helper counted names FOUND and left the Replace's error out
+    /// unwired, so a refused Replace, and a Replace that answers 0 and changes nothing (CLAUDE.md
+    /// records that shape outside the IDE's own instance), were indistinguishable from success
+    /// until the on-disk verify. This separates the three: a code, an in-memory no-op, or a retype
+    /// that reached memory and not the file - which the verify still answers.
+    ///
+    /// A helper from before these indicators existed reports none of them; then nothing is gated
+    /// here and `readBack` says so.
+    /// </summary>
+    internal static Retype RetypeReport(MethodRequest method, JsonObject? values)
+    {
+        var codes = Names(values, "replace error codes")
+            .Select(t => int.TryParse(t, out var c) ? c : (int?)null).ToList();
+        var classes = Names(values, "classes after replace");
+        var names = Names(values, "names after replace");
+        var after = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (var i = 0; i < Math.Min(classes.Count, names.Count); i++)
+            after.TryAdd(names[i], classes[i]);
+
+        var terminals = new JsonArray();
+        var stillPath = new List<string>();
+        var refused = new List<string>();
+        var missing = new List<string>();
+        for (var i = 0; i < method.ClassTerminals.Count; i++)
+        {
+            var name = method.ClassTerminals[i].Name;
+            var code = i < codes.Count ? codes[i] : null;
+            var cls = after.TryGetValue(name, out var c) ? c : null;
+            terminals.Add(new JsonObject
+            {
+                ["terminal"] = name,
+                ["replaceErrorCode"] = code,
+                ["classAfterReplace"] = cls,
+            });
+            if (code is -1) missing.Add(name);
+            else if (code is { } bad && bad != 0) refused.Add($"'{name}' (Error {bad})");
+            if (string.Equals(cls, "Path", StringComparison.Ordinal)) stillPath.Add(name);
+        }
+
+        var readBack = classes.Count > 0;
+        string? hint = null;
+        if (refused.Count > 0)
+            hint = "LabVIEW REFUSED the Replace for " + string.Join(", ", refused) + ". Until " +
+                   "2026-10-12 this code was discarded and the terminal still counted as retyped.";
+        else if (missing.Count > 0)
+            hint = "Not on the panel: " + string.Join(", ", missing.Select(n => $"'{n}'")) +
+                   ". Terminals are matched BY NAME - compare with terminalNamesSeen.";
+        else if (stillPath.Count > 0)
+            hint = "Replace answered NO ERROR for " +
+                   string.Join(", ", stillPath.Select(n => $"'{n}'")) + " and the panel, read " +
+                   "back after the loop, still shows a Path - the retype never happened in memory, " +
+                   "so no save could persist it. The shape CLAUDE.md records for this is Replace " +
+                   "running outside the IDE's own application instance; close the project " +
+                   "(lvai_close_active_project) and call again, and say so if it repeats.";
+
+        return new Retype(new JsonObject
+        {
+            ["terminals"] = terminals,
+            ["replaceErrorCodes"] = new JsonArray([.. codes.Select(x => (JsonNode?)x)]),
+            ["readBack"] = readBack,
+            ["note"] = readBack
+                ? "Each terminal's class is read off the panel AFTER the Replace loop, before " +
+                  "any save. `Path` there means the Replace did nothing in memory."
+                : "This helper reports no read-back (an older build of it), so only the on-disk " +
+                  "verify judges the retype.",
+        }, stillPath, hint);
+    }
+
+    /// <summary>
+    /// The elements of an array indicator, from LabVIEW's flattened XML. HONOURS <c>Dimsize</c>:
+    /// an EMPTY array is still written with one template element (`<Dimsize>0</Dimsize>` and a
+    /// `<String><Val></Val></String>`), which read as one empty name until 2026-10-12.
+    /// </summary>
+    internal static List<string> Names(JsonObject? values, string name)
     {
         if ((values?[name] as JsonObject)?["xml"]?.GetValue<string>() is not { } xml) return [];
-        return [.. System.Text.RegularExpressions.Regex.Matches(xml, "<Val>([^<]*)</Val>")
-            .Select(m => m.Groups[1].Value)];
+        var all = System.Text.RegularExpressions.Regex.Matches(xml, "<Val>([^<]*)</Val>")
+            .Select(m => m.Groups[1].Value).ToList();
+        var size = System.Text.RegularExpressions.Regex.Match(xml, "<Dimsize>(\\d+)</Dimsize>");
+        return size.Success && int.TryParse(size.Groups[1].Value, out var n) && n < all.Count
+            ? all.Take(n).ToList()
+            : all;
     }
 
     /// <summary>
@@ -857,14 +1140,21 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
         var typed = evidence["classTypedTerminals"]?.GetValue<int>() ?? -1;
         var left = evidence["pathStandInsLeft"]?.GetValue<int>() ?? -1;
         var want = evidence["expectedPathStandInsLeft"]?.GetValue<int?>();
+        var listed = evidence["listedInClassFile"]?.GetValue<bool>();
         return new JsonObject
         {
             ["classTypedTerminals"] = typed,
             ["pathStandInsLeft"] = left,
             ["expectedPathStandInsLeft"] = want,
             ["expected"] = expected,
+            ["listedInClassFile"] = listed,
             ["ran"] = evidence["ran"]?.GetValue<bool>() ?? true,
-            ["hint"] = typed == -1
+            ["hint"] = listed is false && typed == expected
+                ? "Every terminal is class-typed in the saved file, but the .lvclass does NOT list "
+                  + "this VI, so it is not a member - LabVIEW loads it eBad. Call again with the "
+                  + "method's \"aixml\" and projectPath: the convert writes the VI afresh and the "
+                  + "first-run path makes it a member."
+                : typed == -1
                 ? "The check could not run at all, so this says nothing about the file - see `ran` "
                   + "and `why` in the verify step."
                 // COMPARED AGAINST THE EXPECTATION, not against zero. A method may declare genuine
@@ -879,7 +1169,9 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                             : "")
                       + ". Either a terminal was left out of classTerminals, or its name is "
                       + "spelled differently there than on the pane - compare with `terminal "
-                      + "names seen` in the member step."
+                      + "names seen` in the member step. If the `retype` step read every requested "
+                      + "terminal back off `Path`, the retype reached MEMORY and not the saved "
+                      + "file - close the project (lvai_close_active_project) and call again."
                     : $"{typed} of {expected} terminals are class-typed in the SAVED file. The "
                       + "retype may have stayed in memory: that is the 2026-09-02 failure this "
                       + "check exists for.",
@@ -1096,9 +1388,10 @@ internal sealed class ClassMethodTools(LvaiConnection connection)
                               "PROJECT ITEM - it was open when the VI was converted. 1004 means " +
                               "either that the VI is already a MEMBER, or that `Name` got a full " +
                               "path where a bare name belongs. Both no-op cases are tolerated " +
-                              "automatically when the .lvclass already lists the VI; seeing 1004 " +
-                              "HERE therefore means the class file does NOT list it, so check the " +
-                              "spelling of the VI's file name against the class's Item entries.",
+                              "automatically when the .lvclass already lists the VI, or when the " +
+                              "VI file itself names the class as its owner (LIBN); seeing 1004 " +
+                              "HERE therefore means neither was read, so check the spelling of the " +
+                              "VI's file name against the class's Item entries.",
         "wire rule error" => "SetWireRule failed. A conIdx that is not on this pane's pattern is " +
                              "the usual cause; check with lvai_connector_pane.",
         "save vi error" => "Save.Instrument failed - most often the file is read-only or held.",

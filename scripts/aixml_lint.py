@@ -222,12 +222,35 @@ def parse_terminal_list(value: str) -> list[tuple[str, str]]:
     for entry in split_unescaped(value, ","):
         if not entry.strip():
             continue
-        halves = split_unescaped(entry, ":", maxsplit=1)
+        halves = split_unescaped(entry, ":")
         if len(halves) == 1:
             pairs.append((unescape(halves[0]), ""))
         else:
-            pairs.append((unescape(halves[0]), unescape(halves[1])))
+            # a RAW colon inside the terminal name (`s? t:f:4220.out`, Select's output written
+            # without its \\3A): the net is after the LAST colon, or the net comes out as
+            # `t:f:4220.out` and is reported as a typo of the real one. check_raw_colons
+            # names the spelling itself.
+            pairs.append((unescape(":".join(halves[:-1])), unescape(halves[-1])))
     return pairs
+
+
+def check_raw_colons(elements) -> list:
+    """A terminal name with an UNESCAPED colon - NI writes Select's output as `s? t\\3Af`. The
+    composer happens to accept `s? t:f`; a stricter reader splits it at the wrong colon."""
+    findings = []
+    for e in elements:
+        for attr in ("inputs", "outputs"):
+            raw = e.el.get(attr)
+            if not raw:
+                continue
+            for entry in split_unescaped(raw, ","):
+                if len(split_unescaped(entry, ":")) > 2:
+                    term = ":".join(split_unescaped(entry, ":")[:-1])
+                    findings.append(Finding(
+                        "warning", "terminal-raw-colon", e.uid, e.label(), e.path,
+                        f'{attr} names the terminal "{term}" with a raw colon - write it as '
+                        f'NI exports it, with \\3A for the colon (`s? t\\3Af` for Select).'))
+    return findings
 
 
 # --------------------------------------------------------------------------
@@ -737,8 +760,9 @@ def check_case_tunnels(elements: list[_El]) -> list[Finding]:
     written elsewhere is "every frame must declare every tunnel", and measured over 52 proven
     documents that is too strong: `scripts/lvai_add_class_method.xml` and
     `scripts/lvlu_add_test_method.xml` both have a frame that declares only `Out1` and omits
-    `In1`-`In3`, and both are shipped helpers that run. Not one document anywhere omits an
-    `Out` tunnel. So an unused IN tunnel may be left out of a frame; an OUT one may not.
+    `In1`-`In3`, and both are shipped helpers that run. So an unused IN tunnel may be left out
+    of a frame; an OUT one may not - UNLESS the structure's tunnel carries cond="true", "use
+    default if unwired", which NI's own exports omit from frames routinely.
 
     THE DEFAULT FRAME IS NOT CHECKED EITHER, for the same reason. "Always add a Default frame"
     would fire on all 8 case structures in those documents - none has one, including two whose
@@ -754,7 +778,12 @@ def check_case_tunnels(elements: list[_El]) -> list[Finding]:
             continue
 
         declared = {c.get("_id") for c in e.el if c.tag == "Tunnel" and c.get("_id")}
-        required_out = {i for i in declared if i.startswith("Out")}
+        # an output tunnel with cond="true" ("use default if unwired") MAY be left out of a
+        # frame - that frame then gives the type's default. 143 of 600 of NI's cached exports
+        # carry one; the composer builds it (t89), and the ATM build's agent was told it was an
+        # error and rewired its frames with FALSE constants (2026-10-11)
+        defaulted = {c.get("_id") for c in e.el if c.tag == "Tunnel" and c.get("cond") == "true"}
+        required_out = {i for i in declared if i.startswith("Out") and i not in defaulted}
 
         for frame in frames:
             inner = {c.get("_id") for c in frame if c.tag == "Tunnel" and c.get("_id")}
@@ -898,6 +927,146 @@ def check_property_nodes(elements: list[_El]) -> list[Finding]:
                         f"innocent nodes into the message with it.",
                     )
                 )
+    return findings
+
+
+def _load_vocabulary():
+    """The names a Property or Invoke Node may use - the SAME four tables AixmlCheck.cs embeds:
+    LabVIEW's catalogue (vi-server-properties.tsv, vi-server-methods.tsv), its class list
+    (vi-server-classes.tsv) and the names WORKING AIXML uses (vi-server-aixml-names.tsv, from
+    scripts/harvest_aixml_vi_server_names.py). A name in either source is known - the catalogue
+    alone misses half of our own helpers' names (see _load_catalogue above). Absent tables leave
+    the vocabulary empty, and an empty vocabulary judges nothing."""
+    docs = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "docs")
+    props: dict[str, set[str]] = {}
+    methods: dict[str, set[str]] = {}
+    classes: set[str] = set()
+
+    def rows(name):
+        try:
+            with open(os.path.join(docs, name), encoding="utf-8") as fh:
+                next(fh, None)
+                for line in fh:
+                    if line.strip():
+                        yield line.rstrip("\r\n").split("\t")
+        except OSError:
+            return
+
+    for r in rows("vi-server-properties.tsv"):
+        if len(r) >= 2:
+            props.setdefault(r[0], set()).add(r[1])
+    for r in rows("vi-server-methods.tsv"):
+        if len(r) >= 2:
+            methods.setdefault(r[0], set()).add(_fold_method(r[1]))
+    for r in rows("vi-server-aixml-names.tsv"):
+        if len(r) >= 3 and r[1] == "property":
+            props.setdefault(r[0], set()).add(r[2])
+        elif len(r) >= 3 and r[1] == "method":
+            methods.setdefault(r[0], set()).add(_fold_method(r[2]))
+    for r in rows("vi-server-classes.tsv"):
+        if r and r[0]:
+            classes.add(r[0])
+    return props, methods, classes
+
+
+def _fold_method(name: str) -> str:
+    """A method's dotted and spaced spellings are one name; LabVIEW accepts either."""
+    return " ".join(name.replace(".", " ").split())
+
+
+_VOCAB_PROPS, _VOCAB_METHODS, _VOCAB_CLASSES = _load_vocabulary()
+
+
+def _nearest_name(name: str, known) -> str | None:
+    best, best_d = None, None
+    for cand in known:
+        d = _edit_distance(name.lower(), cand.lower())
+        if best_d is None or d < best_d:
+            best, best_d = cand, d
+    return best if best is not None and best_d <= max(2, len(name) // 3) else None
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cur[j] = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+        prev = cur
+    return prev[len(b)]
+
+
+def check_vi_server_names(elements: list[_El]) -> list[Finding]:
+    """Property fields and Invoke targets no source knows - AixmlCheck.CheckViServerNames.
+
+    MEASURED 2026-10-10, LabVIEW 2026 32-bit: fields="read+Version Number" on {LV.Application}
+    KILLED LabVIEW inside ConvertAIXMLToVI, 4 of 4 runs (`Fatal insanities ... in
+    ReportInsanities`); `Application\\3AVersion Number` converted and ran. Only that class and
+    that shape were measured. So:
+      error   property-name-unknown     unknown, and a known name of the class is `Category:` +
+                                        it - the crash shape; lvai_convert_aixml_to_vi and
+                                        lvai_validate_aixml refuse such a document
+      warning property-name-not-known   unknown otherwise (both lists are incomplete)
+      warning method-name-not-known     an Invoke target nobody lists
+      warning vi-server-class-unknown   an {LV.*} type that is not one of the 296 classes
+    A dotted nested property (`Label.Text`) is accepted when its head is a known property.
+    """
+    findings: list[Finding] = []
+    if not _VOCAB_PROPS:
+        return findings
+    for e in elements:
+        if e.tag != "Node" or e.name not in ("Property Node", "Invoke Node"):
+            continue
+        cls = e.el.get("type") or ""
+        if not cls.startswith("{"):
+            continue
+        if cls.startswith("{LV.") and cls[4:-1] not in _VOCAB_CLASSES \
+                and cls not in _VOCAB_PROPS and cls not in _VOCAB_METHODS:
+            findings.append(Finding("warning", "vi-server-class-unknown", e.uid, e.label(), e.path,
+                                    f"{cls} is not one of LabVIEW's VI Server classes "
+                                    f"(docs/vi-server-classes.tsv lists all 296)."))
+            continue
+        if e.name == "Property Node":
+            known = _VOCAB_PROPS.get(cls)
+            if not known:
+                continue
+            for entry in (e.el.get("fields") or "").split(","):
+                if "+" not in entry:
+                    continue
+                name = unescape(entry.split("+", 1)[1])
+                if not name or name in known or ("." in name and name.split(".", 1)[0] in known):
+                    continue
+                full = sorted((k for k in known if k.lower().endswith(":" + name.lower())), key=len)
+                if full:
+                    # Several matches are several DIFFERENT properties (Version Number on
+                    # {LV.Application}: Application:... and Operating System:...) - name them all.
+                    names = " or ".join(f'"{k}"' for k in full)
+                    findings.append(Finding(
+                        "error", "property-name-unknown", e.uid, e.label(), e.path,
+                        f'"{name}" on {cls} is not a property name; {names} '
+                        f'{"is" if len(full) == 1 else "are"}. The short form was measured KILLING '
+                        f"LabVIEW inside ConvertAIXMLToVI - write the full name."))
+                    continue
+                near = _nearest_name(name, known)
+                findings.append(Finding(
+                    "warning", "property-name-not-known", e.uid, e.label(), e.path,
+                    f'"{name}" on {cls} is in neither the catalogue nor any AIXML known to work'
+                    + (f'; nearest: "{near}"' if near else "")
+                    + ". Verify it by exporting a VI that uses it."))
+        else:
+            target = e.el.get("target")
+            known = _VOCAB_METHODS.get(cls)
+            if not target or not known:
+                continue
+            name = unescape(target)
+            if _fold_method(name) in known:
+                continue
+            near = _nearest_name(_fold_method(name), known)
+            findings.append(Finding(
+                "warning", "method-name-not-known", e.uid, e.label(), e.path,
+                f'method "{name}" on {cls} is in neither the catalogue nor any AIXML known to work'
+                + (f'; nearest: "{near}"' if near else "")
+                + ". ValidateAIXML answers `Invalid method` for an invented one."))
     return findings
 
 
@@ -1565,8 +1734,10 @@ def lint_file(path: str) -> list[Finding]:
     findings += check_web_browser_reference(elements)
     findings += check_value_escapes(elements)
     findings += check_case_tunnels(elements)
+    findings += check_raw_colons(elements)
     findings += check_type_grammar(elements)
     findings += check_property_nodes(elements)
+    findings += check_vi_server_names(elements)
     findings += check_terminal_lists(elements)
     findings += check_net_attributes(elements)
     findings += check_types(elements)

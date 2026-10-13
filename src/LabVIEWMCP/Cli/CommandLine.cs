@@ -53,6 +53,7 @@ internal static class CommandLine
         ["--access"] = true,
         ["--fields"] = true,
         ["--parent"] = true,
+        ["--aixml-backend"] = true,
     };
 
     /// <summary>
@@ -99,6 +100,11 @@ internal static class CommandLine
                                             and reopen the project. Does NOT save the project
 
           --port <n>        pin LabVIEW's gRPC port instead of discovering it
+          --aixml-backend <b>  which route the tools that reach LabVIEW take when a call names none:
+                            grpc (NI's service in LabVIEW), pylabview (our own composer, no
+                            NI service needed) or auto. Overrides "aixmlBackend" in
+                            %USERPROFILE%\.labviewmcp\settings.json, the usual place to choose
+                            - the file explains every value. docs/aixml-backends.md
           --lvversion <v>   LVVersion stamped into NEW .lvproj/.lvclass/.lvlib files,
                             as a year (2025) or a stamp (25008000). Detected from the
                             running LabVIEW otherwise; may not be NEWER than it
@@ -131,7 +137,7 @@ internal static class CommandLine
           --help            print this text
 
         LABVIEW_GRPC_PORT works instead of --port, LABVIEWMCP_LVVERSION instead of
-        --lvversion. The self-test needs the LabVIEW this server connects to running WITH its
+        --lvversion, LABVIEWMCP_AIXML_BACKEND instead of --aixml-backend. The self-test needs the LabVIEW this server connects to running WITH its
         AI assistant open: the lvai gRPC service starts with Nigel, not with the IDE.
         """;
 

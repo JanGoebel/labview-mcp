@@ -63,8 +63,9 @@ internal sealed class ConstantTools(LvaiConnection connection)
         [Description("The new value as text - '2', '0.5', 'TRUE', 'CH9', or an enum item name. A string may contain line breaks")]
         string value,
         [Description("Local budget in seconds, per step")] int timeoutSeconds = 180,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_set_constant", async () =>
         {
             var vi = Path.GetFullPath(viPath);
             if (!File.Exists(vi))
@@ -136,7 +137,7 @@ internal sealed class ConstantTools(LvaiConnection connection)
                     : "The saved VI does NOT hold the value asked for - read helperErrorCode, and " +
                       "check that no project holding this VI is open in the IDE.",
             });
-        });
+        }));
 
     // ------------------------------------------------------------------ pure parts
 
@@ -238,7 +239,7 @@ internal sealed class ConstantTools(LvaiConnection connection)
                                   Path.GetFileNameWithoutExtension(vi) + ".xml");
         Directory.CreateDirectory(Path.GetDirectoryName(target)!);
         var answer = await new AixmlTools(connection).ConvertViToAixmlAsync(
-            vi, target, returnContent: true, maxContentChars: 0, timeoutSeconds, refresh: true, ct);
+            vi, target, returnContent: true, maxContentChars: 0, timeoutSeconds, refresh: true, ct: ct);
         try
         {
             var xml = (JsonNode.Parse(answer) as JsonObject)?["xml"]?.GetValue<string>();
@@ -252,7 +253,10 @@ internal sealed class ConstantTools(LvaiConnection connection)
     {
         if (!File.Exists(aixml))
             return (null, Json.Error("helperMissing", $"No helper AIXML at '{aixml}'."));
-        var vi = Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers",
+        // ON PYLABVIEW the helper is COMPOSED into helpers-pylabview and run over ActiveX
+        if (BackendRoute.OnPyLabview)
+            return (await BackendRoute.ComposedHelperAsync(aixml, timeoutSeconds, ct), null);
+        var vi = Path.Combine(AixmlBackend.HelperFolder(),
                               Path.ChangeExtension(Path.GetFileName(aixml), ".vi"));
         Directory.CreateDirectory(Path.GetDirectoryName(vi)!);
         if (File.Exists(vi) && File.GetLastWriteTimeUtc(aixml) <= File.GetLastWriteTimeUtc(vi))

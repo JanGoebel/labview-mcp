@@ -133,7 +133,9 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         `inputs` sets ANY input terminal of the method, required or not: a required one is always
         wired (with the default where the case gives none), any other only when the case names it,
         so an unnamed one keeps the method's own default. A name the method does not declare is
-        refused (`inputTerminalNotFound`), as is the class or error input (`inputNotSettable`).
+        refused (`inputTerminalNotFound`), as is the class or error input (`inputNotSettable`), and
+        a front-panel object with no conIdx in `inputs` or `expectOutput` (`terminalNotOnPane`) -
+        a Call cannot wire it, and LabVIEW says only `An input parameter is invalid`.
         Until 2026-09-25 a value for a non-required terminal was dropped in silence.
         EVERY METHOD MUST ALREADY BE A CLASS MEMBER with a class-typed pane - use
         lvai_add_class_method first. A method whose .vi is missing is named rather than generated.
@@ -190,9 +192,13 @@ internal sealed class MethodTestTools(LvaiConnection connection)
             """)]
         bool directCall = true,
         [Description("Local budget in seconds, per step")] int timeoutSeconds = 300,
-        CancellationToken ct = default) =>
+        CancellationToken ct = default,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
+        [Description(TestTools.MeasureTestDiagramDescription)] bool measureDiagram = true) =>
         await Rpc.GuardAsync(async () =>
         {
+            if (!AixmlBackend.TryResolve(backend, "lvai_generate_method_test", out _, out var badBackend))
+                return AixmlBackend.Refusal(badBackend);
             if (!File.Exists(lvclassPath))
                 return Json.Error("badArguments", $"No .lvclass at '{lvclassPath}'.");
             if (projectPath is { Length: > 0 } && !File.Exists(projectPath))
@@ -354,20 +360,25 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                 int? outputConIdx = null;
                 if (request.ExpectOutput is { } wanted)
                 {
-                    var match = terminals!.Outputs
-                        .FirstOrDefault(t => t.Name.Equals(wanted, StringComparison.Ordinal));
-                    if (match.Name is null)
-                        return Json.Error("outputTerminalNotFound",
-                            $"'{request.Method}' has no output terminal called '{wanted}'. " +
-                            "Names are literal and case-sensitive, and a wrong one is not caught " +
-                            "later - the swap would re-attach the wire by name, leave the real " +
-                            "terminal unwired, and the suite would pass having asserted nothing.",
+                    // THE SAME RULE AS `inputs`: a pane OUTPUT, or refused by name - an indicator
+                    // off the pane cannot be read off the method's Call (2026-10-12).
+                    var check = ViTerminals.CheckCallNames(terminals!, [], [wanted]);
+                    if (!check.Ok)
+                        return Json.Error(
+                            check.NotOnPane.Count > 0 ? "terminalNotOnPane" : "outputTerminalNotFound",
+                            check.Message($"`expectOutput` for '{request.Method}'") +
+                            " A wrong name is not caught later - the swap would re-attach the " +
+                            "wire by name, leave the real terminal unwired, and the suite would " +
+                            "pass having asserted nothing.",
                             new
                             {
                                 method = request.Method,
                                 asked = wanted,
-                                available = terminals.Outputs.Select(t => t.Name).ToArray(),
+                                available = check.PaneOutputs.ToArray(),
+                                check = check.ToJson(),
                             });
+                    var match = terminals!.PaneOutputs
+                        .First(t => t.Name.Equals(wanted, StringComparison.Ordinal));
 
                     outputType ??= match.Type;
                     var freeOut = FreeOutputSlots();
@@ -403,7 +414,8 @@ internal sealed class MethodTestTools(LvaiConnection connection)
             {
                 var (done, fallback) = await DirectMethodTestAsync(
                     lvclassPath, className, testViPath, cases, methodShapes, projectPath,
-                    testFolderName, scratch, keepAixml, steps, total, route, timeoutSeconds, ct);
+                    testFolderName, scratch, keepAixml, steps, total, route, measureDiagram,
+                    timeoutSeconds, ct);
                 if (done is not null) return done;
                 route["route"] = "sockets";
                 route["reason"] = fallback;
@@ -448,7 +460,7 @@ internal sealed class MethodTestTools(LvaiConnection connection)
 
             var sockets = await new BulkTools(connection).GenerateVisAsync(
                 pairs.ToJsonString(), openVI: false, measurePane: false, keepAixml, timeoutSeconds,
-                ct);
+                ct: ct);
             steps.Add(new JsonObject { ["step"] = "sockets", ["answer"] = Read(sockets) });
             if ((Read(sockets) as JsonObject)?["ok"]?.GetValue<bool>() is not true)
                 return Outcome(false, "sockets", steps, total, testViPath, null,
@@ -458,11 +470,12 @@ internal sealed class MethodTestTools(LvaiConnection connection)
             // ---- 2. the suite
             var testAixml = Path.Combine(scratch,
                 Path.ChangeExtension(Path.GetFileName(testViPath), ".xml"));
-            await File.WriteAllTextAsync(testAixml, MethodTestAixml(testViPath, className, cases), ct);
+            await File.WriteAllTextAsync(testAixml, await CarayaAssert.AdaptToInstalledAsync(
+                connection, MethodTestAixml(testViPath, className, cases), timeoutSeconds, ct), ct);
 
             var generated = await new BulkTools(connection).GenerateViAsync(
                 testAixml, testViPath, openVI: false, measurePane: true, panePattern: null,
-                timeoutSeconds, ct: ct);
+                timeoutSeconds, ct: ct, measureDiagram: measureDiagram);
             steps.Add(new JsonObject { ["step"] = "generate", ["answer"] = Read(generated) });
             if ((Read(generated) as JsonObject)?["viExistsNow"]?.GetValue<bool>() is not true)
                 return Outcome(false, "generate", steps, total, testViPath, testAixml,
@@ -676,7 +689,7 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         string lvclassPath, string className, string testViPath, List<MethodCase> cases,
         List<(DirectMethodCall? Call, string? Why)> methodShapes, string? projectPath,
         string testFolderName, string scratch, bool keepAixml, JsonArray steps, Stopwatch total,
-        JsonObject route, int timeoutSeconds, CancellationToken ct)
+        JsonObject route, bool measureDiagram, int timeoutSeconds, CancellationToken ct)
     {
         if (methodShapes.FirstOrDefault(s => s.Call is null).Why is { } unrecognised)
             return (null, unrecognised);
@@ -798,34 +811,52 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         });
 
         // 3. load the class through its project - one member is enough for all of them
-        //    - and every setup VI with it, in the same call
-        var open = await new ActionTools(connection).OpenFileAsync(
-            cases[0].MethodVi, Path.GetFileName(cases[0].MethodVi), project,
-            Path.GetFileName(project), checkActive: true, timeoutSeconds, ct,
-            viPaths: setups.Count > 0 ? string.Join("\n", setups.Keys) : null);
-        steps.Add(new JsonObject { ["step"] = "openClass", ["answer"] = Read(open) });
-        if (Read(open) is not JsonObject opened || opened["errorCode"]?.GetValue<int>() is not 0 ||
-            opened["projectBecameActive"]?.GetValue<bool>() is not true ||
-            opened["allOpened"]?.GetValue<bool>() is false)
-            return (null, "The class's project did not become active, or a setup VI did not open, " +
-                          "so they are not known to be loaded - read the openClass step.");
-
-        async Task CloseAsync()
+        //    - and every setup VI with it, in the same call. ON PYLABVIEW NOTHING IS LOADED: the
+        //    composer resolves members and setup VIs by FILE, so their folders are searched
+        //    instead (2026-10-11)
+        var composed = AixmlBackend.Inherited.Value?.Name == AixmlBackend.PyLabview;
+        if (composed)
         {
-            var closed = await new CloseTools(connection).CloseActiveProjectAsync(
-                projectPath: project, timeoutSeconds: timeoutSeconds, ct: ct);
-            steps.Add(new JsonObject { ["step"] = "closeProject", ["answer"] = Read(closed) });
+            AixmlComposer.ExtraSearch.Value =
+                [.. new[] { lvclassPath }.Concat(setups.Keys)
+                    .Select(f => Path.GetDirectoryName(Path.GetFullPath(f))!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)];
+            steps.Add(new JsonObject
+            {
+                ["step"] = "openClass",
+                ["skipped"] = true,
+                ["note"] = "pylabview backend: the composer finds the class and any setup VI by " +
+                           "FILE, so nothing is opened; their folders are searched instead.",
+            });
         }
+        else
+        {
+            var open = await new ActionTools(connection).OpenFileAsync(
+                cases[0].MethodVi, Path.GetFileName(cases[0].MethodVi), project,
+                Path.GetFileName(project), checkActive: true, timeoutSeconds, ct,
+                viPaths: setups.Count > 0 ? string.Join("\n", setups.Keys) : null);
+            steps.Add(new JsonObject { ["step"] = "openClass", ["answer"] = Read(open) });
+            if (Read(open) is not JsonObject opened || opened["errorCode"]?.GetValue<int>() is not 0 ||
+                opened["projectBecameActive"]?.GetValue<bool>() is not true ||
+                opened["allOpened"]?.GetValue<bool>() is false)
+                return (null, "The class's project did not become active, or a setup VI did not open, " +
+                              "so they are not known to be loaded - read the openClass step.");
+        }
+
+        async Task CloseAsync() =>
+            steps.Add(await tests.ReleaseProjectAsync(project, timeoutSeconds, ct));
 
         // 4. author against the real members and generate. `execState` failing HERE is expected
         //    and is not a failure: the seeds are still paths wired into class inputs.
         var testAixml = Path.Combine(scratch,
             Path.ChangeExtension(Path.GetFileName(testViPath), ".xml"));
-        await File.WriteAllTextAsync(testAixml,
-            MethodTestAixml(testViPath, className, cases, methods, accessors, seedCalls, setups), ct);
+        await File.WriteAllTextAsync(testAixml, await CarayaAssert.AdaptToInstalledAsync(connection,
+            MethodTestAixml(testViPath, className, cases, methods, accessors, seedCalls, setups,
+                            classSeeds: composed),
+            timeoutSeconds, ct), ct);
         var generated = await new BulkTools(connection).GenerateViAsync(
             testAixml, testViPath, openVI: false, measurePane: true, panePattern: null,
-            timeoutSeconds, ct: ct);
+            timeoutSeconds, ct: ct, measureDiagram: measureDiagram);
         steps.Add(TestTools.GenerateStepBeforeSeeds(Read(generated)));
         var answer = Read(generated) as JsonObject;
 
@@ -843,21 +874,38 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                 route: Direct(route)), null);
         }
 
-        // 5. the seeds become the class - the one Replace this route cannot do without
-        var seeds = new JsonArray([.. cases.Select(test => (JsonNode)new JsonObject
-        { ["label"] = test.SeedLabel, ["class"] = test.SeedClassPath })]);
-        var swapped = await new SwapTools(connection).SwapSubVisAsync(
-            testViPath, null, seeds.ToJsonString(), verify: true, verbose: false,
-            helperViPath: null, helperAixmlPath: null, regenerateHelper: false, editsJson: null,
-            timeoutSeconds, ct: ct);
-        steps.Add(new JsonObject { ["step"] = "seeds", ["answer"] = Read(swapped) });
-        var swapAnswer = Read(swapped) as JsonObject;
-        if (swapAnswer?["ok"]?.GetValue<bool>() is not true)
+        // 5. the seeds become the class - the one Replace this route cannot do without. NOT on
+        //    pylabview: the composer wrote them as class constants in the first place
+        JsonNode? callTargets;
+        if (composed)
         {
-            await CloseAsync();
-            return (Outcome(false, "seeds", steps, total, testViPath, testAixml,
-                "THE TEST VI WAS WRITTEN and calls the real methods, but its seed constants are " +
-                "still paths, so it cannot run. Read the seeds step.", route: Direct(route)), null);
+            callTargets = await tests.ComposedCallTargetsAsync(testViPath, scratch, timeoutSeconds, ct);
+            steps.Add(new JsonObject
+            {
+                ["step"] = "seeds",
+                ["skipped"] = true,
+                ["note"] = "pylabview backend: the seeds were composed as class constants, so " +
+                           "no Replace is needed.",
+            });
+        }
+        else
+        {
+            var seeds = new JsonArray([.. cases.Select(test => (JsonNode)new JsonObject
+            { ["label"] = test.SeedLabel, ["class"] = test.SeedClassPath })]);
+            var swapped = await new SwapTools(connection).SwapSubVisAsync(
+                testViPath, null, seeds.ToJsonString(), verify: true, verbose: false,
+                helperViPath: null, helperAixmlPath: null, regenerateHelper: false, editsJson: null,
+                timeoutSeconds, ct: ct);
+            steps.Add(new JsonObject { ["step"] = "seeds", ["answer"] = Read(swapped) });
+            var swapAnswer = Read(swapped) as JsonObject;
+            callTargets = swapAnswer?["callTargets"]?.DeepClone();
+            if (swapAnswer?["ok"]?.GetValue<bool>() is not true)
+            {
+                await CloseAsync();
+                return (Outcome(false, "seeds", steps, total, testViPath, testAixml,
+                    "THE TEST VI WAS WRITTEN and calls the real methods, but its seed constants are " +
+                    "still paths, so it cannot run. Read the seeds step.", route: Direct(route)), null);
+            }
         }
 
         // 5b. every generated constant that feeds a TYPEDEF terminal carries the typedef - seeds,
@@ -889,6 +937,7 @@ internal sealed class MethodTestTools(LvaiConnection connection)
             ["step"] = "execState",
             ["execState"] = reading?.State,
             ["linkerErrors"] = reading?.LinkerErrors,
+            ["openError"] = reading is { CouldNotOpen: true } ? $"{reading.Code}: {reading.Source}" : null,
         });
         if (reading is { Broken: true })
         {
@@ -897,6 +946,19 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                 "THE TEST VI WAS WRITTEN and LabVIEW cannot run it after the seeds were replaced - " +
                 "read linkerErrors in the execState step. A required input of a method that this " +
                 "call did not wire would look exactly like this.", route: Direct(route)), null);
+        }
+        // Unreadable or unopenable is no pass either - the class test answered ok with execState
+        // null over a VI LabVIEW refused to open (2026-10-12), gated on Broken alone.
+        if (reading is null or { CouldNotOpen: true })
+        {
+            await CloseAsync();
+            return (Outcome(false, "execState", steps, total, testViPath, testAixml,
+                reading is null
+                    ? "THE TEST VI WAS WRITTEN and its executability could not be read, so nothing " +
+                      "says it runs. Read it with lvai_exec_state before using it."
+                    : "THE TEST VI WAS WRITTEN and LabVIEW could NOT OPEN it - " + reading.Code + ": " +
+                      reading.Source + ". A file LabVIEW refuses to load is not a test.",
+                route: Direct(route)), null);
         }
 
         if (!keepAixml)
@@ -916,12 +978,14 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         steps.Add(AssertionsStep(cases));
         return (Outcome(true, null, steps, total, testViPath, keepAixml ? testAixml : null,
             $"Generated. {Counts(cases)}, every method and accessor called DIRECTLY - no sockets, " +
-            "no node swaps; only the seed constants were replaced. THE PROJECT IS LEFT CLOSED, " +
+            "no node swaps; " + (composed ? "the seeds were composed as class constants. "
+                                          : "only the seed constants were replaced. ") +
+            "THE PROJECT IS LEFT CLOSED, " +
             "and lvai_run_caraya_tests runs the suite with it closed. Read the JUnit report, and " +
             "break one " +
             "expectation on purpose once - one of `expectedConstants`, with lvai_set_constant - " +
             "because an all-green first run proves very little.",
-            swapAnswer["callTargets"]?.DeepClone(), Direct(route), ExpectedConstants(cases)), null);
+            callTargets, Direct(route), ExpectedConstants(cases)), null);
     }
 
     private static JsonObject Direct(JsonObject route)
@@ -1108,7 +1172,8 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                                            IReadOnlyList<DirectMethodCall>? methods = null,
                                            IReadOnlyList<TestTools.DirectAccessorCall?>? accessors = null,
                                            IReadOnlyList<IReadOnlyList<DirectWriteCall>>? seedCalls = null,
-                                           IReadOnlyDictionary<string, TestTools.SetupShape>? setups = null)
+                                           IReadOnlyDictionary<string, TestTools.SetupShape>? setups = null,
+                                           bool classSeeds = false)
     {
         var geometry = StationPaneDefault.Read().Pattern is { } pattern
             ? ConnectorPanePatterns.Find(pattern)?.Geometry
@@ -1168,7 +1233,7 @@ internal sealed class MethodTestTools(LvaiConnection connection)
             var accessor = accessors?[index];
 
             var seed = uid++;
-            sb.AppendLine(TestTools.Constant(seed, "path", "", test.SeedLabel));
+            sb.AppendLine(TestTools.Constant(seed, TestTools.SeedType(classSeeds), "", test.SeedLabel));
 
             var objectIn = $"{seed}.value";
 
@@ -1243,13 +1308,18 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                 wired.Add($"{input.Name}:{constant}.value");
             }
 
+            // With no real method this calls the SOCKET, whose pane MethodSocketAixml writes -
+            // `obj in` and `error in`. The fallback said `error in (no error)` here while the
+            // socket said `error in`, so the socket route was refused by every converter
+            // (`Object terminal not found`, the composer's `has no input`) - found 2026-10-11
+            // when the pylabview backend, which has no direct route, took it for the first time.
             var call = uid++;
             var inputs = new List<string>
             { $"{method?.ClassIn ?? "obj in"}:{objectIn}" };
             if (setupChain is not null)
-                inputs.Add($"{method?.ErrorIn ?? "error in (no error)"}:{setupChain}");
+                inputs.Add($"{method?.ErrorIn ?? "error in"}:{setupChain}");
             else if (noError >= 0)
-                inputs.Add($"{method?.ErrorIn ?? "error in (no error)"}:{noError}.value");
+                inputs.Add($"{method?.ErrorIn ?? "error in"}:{noError}.value");
             inputs.AddRange(wired);
 
             // An output the real method does not have is left out rather than named: a Call naming
@@ -1439,19 +1509,27 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         // them. Before 2026-09-25 an `inputs` entry for anything but a `required` terminal was
         // dropped in silence: `Withdraw` with `amount` = 800 (a `recommended` input) ran as a
         // withdrawal of 0, and the case "800 is refused" failed against a correct method.
+        // AND A NAME ON THE PANEL BUT OFF THE PANE IS REFUSED TOO, by the rule lvai_generate_test
+        // applies (2026-10-12): wired into the method's Call it is `Error 1 ... An input parameter
+        // is invalid` from LabVIEW's generator, which names neither the terminal nor the case.
+        if (supplied is { Count: > 0 } &&
+            ViTerminals.CheckCallNames(terminals, supplied.Keys, []) is { Ok: false } refused)
+            return (null, new Fault(
+                refused.NotOnPane.Count > 0 ? "terminalNotOnPane" : "inputTerminalNotFound",
+                refused.Message($"The `inputs` for '{Path.GetFileName(methodVi)}'") +
+                " A value for a terminal the Call cannot wire would be wired to nothing and the " +
+                "case would run on the default.",
+                new
+                {
+                    methodVi,
+                    terminal = refused.NotOnPane.Concat(refused.Unknown)
+                                      .Concat(refused.WrongDirection.Select(w => w.Name)).First(),
+                    inputs = refused.PaneInputs.ToArray(),
+                    check = refused.ToJson(),
+                }));
         foreach (var name in supplied?.Keys ?? Enumerable.Empty<string>())
         {
-            var match = terminals.Inputs.FirstOrDefault(t => t.Name.Equals(name, StringComparison.Ordinal));
-            if (match.Name is null)
-                return (null, new Fault("inputTerminalNotFound",
-                    $"'{Path.GetFileName(methodVi)}' has no input terminal called '{name}'. " +
-                    "Names are literal and case-sensitive; a value for a terminal that does not " +
-                    "exist would be wired to nothing and the case would run on the default.",
-                    new
-                    {
-                        methodVi, terminal = name,
-                        inputs = terminals.Inputs.Select(t => t.Name).ToArray(),
-                    }));
+            var match = terminals.PaneInputs.First(t => t.Name.Equals(name, StringComparison.Ordinal));
             if (match.Type.StartsWith("ref{UDClassInst}", StringComparison.Ordinal)
                 || ConnectorPane.IsErrorIn(match.Name))
                 return (null, new Fault("inputNotSettable",
@@ -1463,7 +1541,7 @@ internal sealed class MethodTestTools(LvaiConnection connection)
 
         var slots = FreeSocketSlots();
         var resolved = new List<RequiredInput>();
-        foreach (var terminal in terminals.Inputs)
+        foreach (var terminal in terminals.PaneInputs)
         {
             if (terminal.Type.StartsWith("ref{UDClassInst}", StringComparison.Ordinal)) continue;
             if (ConnectorPane.IsErrorIn(terminal.Name)) continue;
@@ -1578,8 +1656,8 @@ internal sealed class MethodTestTools(LvaiConnection connection)
         internal static DirectWriteCall? From(ViTerminals.Result write, string target)
         {
             const string classType = "ref{UDClassInst}";
-            var inputs = write.Inputs.Where(t => t.ConIdx is not null).ToList();
-            var outputs = write.Outputs.Where(t => t.ConIdx is not null).ToList();
+            var inputs = write.PaneInputs;
+            var outputs = write.PaneOutputs;
             var classIn = inputs.Where(t => t.Type == classType).ToList();
             var classOut = outputs.Where(t => t.Type == classType).ToList();
             var data = inputs.Where(t => t.Type != classType && t.Type != ErrorCluster).ToList();
@@ -1613,8 +1691,8 @@ internal sealed class MethodTestTools(LvaiConnection connection)
                 return hits.Count == 1 ? hits[0] : null;
             }
 
-            var inputs = method.Inputs.Where(t => t.ConIdx is not null).ToList();
-            var outputs = method.Outputs.Where(t => t.ConIdx is not null).ToList();
+            var inputs = method.PaneInputs;
+            var outputs = method.PaneOutputs;
 
             var classIn = Dispatch(inputs);
             if (classIn is null)

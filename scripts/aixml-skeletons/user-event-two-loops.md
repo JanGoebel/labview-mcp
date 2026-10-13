@@ -32,6 +32,22 @@ A comment between children of `<VI>` is the loud case, `Error 42`. Measured 2026
 `pylv-strip-compiled.py` over the bundle before the field edit or the rebuild carries compiled code
 describing the diagram from before it.
 
+**On the `pylabview` backend it is ONE call, and the placeholder is not needed** (measured
+2026-10-10): our composer writes the user-event spec, the wire onto the dynamic event terminal and
+the payload field itself - `lvai_convert_aixml_to_vi` with `backend: "pylabview"` on this document
+gives an executable VI that runs `Ticks Received = 5`. Name
+the payload in the Event Data Node (`fields="Source,Tick,Time"`, `outputs="...,Tick:<net>,..."`) and
+wire it where it is used, as LabVIEW's own export of the finished VI does; a variant in which only
+the payload can stop the handler stopped on it. A CLUSTER payload works the same way, its elements
+named one by one (`fields="Source,Last,N,Time"`) - fields 4 and 5 for a two-element cluster, as the
+section on the field index below says. SEVERAL user events in one `Register For Events` work too -
+repeat the input, `event source:<a>,event source:<b>`, and give each its own frame - on BOTH routes
+since 2026-10-11: the three calls above finish several user-event frames as well, each frame's
+`dynIndex` being its event's position in the registration (`docs/labview-vit-templates.md` §5a).
+On `pylabview` a control reference may be a source too, and one frame may handle several events.
+The one limit left: the registration routed into the structure through a tunnel, as below.
+`experiments/aixml-without-grpc/FINDINGS.md` §7a, "User events" (source tree only).
+
 **Step 3 IS a shipped tool: `lvai_set_event_data_fields`.** This paragraph said it was not, and
 that it should be productised - it had been, and the stale sentence sent a 2026-09-12 build to drive
 `experiments/pylabview/event-data-fields/` by hand instead of making one call. The script is still

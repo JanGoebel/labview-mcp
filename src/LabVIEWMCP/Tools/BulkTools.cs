@@ -110,7 +110,66 @@ internal sealed class BulkTools(LvaiConnection connection)
             VI is written - but the answer says so and names the chain to fold into a subVI.
             Costs one render, 90-320 ms measured.
             """)]
-        bool measureDiagram = true) =>
+        bool measureDiagram = true,
+        [Description(AixmlBackend.ParameterDescription + """
+             On pylabview the validate step is skipped - the composer refuses by name instead - and
+            the VI's executability is read in its place, because the composer does not type-check
+            wiring. NO STEP touches NI's service: executability and the diagram size go over
+            LabVIEW's ActiveX server (which needs a RUNNING LabVIEW and never starts one), the pane
+            is read from the file by pylabview, and panePattern rebuilds without closing a project.
+            """)]
+        string? backend = null,
+        [Description("""
+            Run LabVIEW's own Clean Up Diagram on the written VI and save it in place - {LV.VI}
+            BD.CleanUp then Save.Instrument, the two calls NI's Message Maker makes on every VI it
+            scripts - BEFORE the diagram is measured, so diagramSize is the diagram you get. Omit
+            it to clean up whenever the diagram is measured, which is every deliverable; helpers
+            and carriers skip it. Skipped with openVI, where the IDE holds its own copy. A VI that
+            had no compiled code comes back with none: a LabVIEW save that writes some is stripped
+            again. A failed clean-up does not fail the call - the VI is as generated, and the
+            cleanUpDiagram step says why.
+            """)]
+        bool? cleanUpDiagram = null,
+        [Description("""
+            Arrange the FRONT PANEL with the algorithm behind LabVIEW's Edit - Clean Up Panel and
+            save in place - the user's rule for every VI that is NOT the application's MAIN VI,
+            whose panel is the user interface and laid out on purpose: pass false for that one.
+            Omit it to follow cleanUpDiagram. A panel holding a tab control or a splitter is left
+            alone (the algorithm answers it with a modal dialog), reported as skipped.
+            """)]
+        bool? cleanUpPanel = null)
+    {
+        if (!AixmlBackend.TryResolve(backend, "lvai_generate_vi", out var choice, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
+        var cleanDiagram = cleanUpDiagram ?? measureDiagram;
+        var answer = AixmlTools.WithBackend(await GenerateViCoreAsync(
+            aiXmlFilePath, viPath, openVI, measurePane, panePattern, timeoutSeconds, measureDiagram,
+            choice, cleanDiagram, cleanUpPanel ?? cleanDiagram, ct), choice);
+        return choice.Name == AixmlBackend.PyLabview ? WithUnmeasuredExecutability(answer) : answer;
+    }
+
+    /// <summary>
+    /// On pylabview NEITHER of the two things that vouch for a VI ran when LabVIEW was absent: NI's
+    /// validation is skipped by design and the execution state could not be read. Measured over
+    /// stdio 2026-10-10: the answer was `ok: true` with a note about the pane alone, and the reason
+    /// sat inside the convert step. So it is lifted into the note a reader actually reads.
+    /// </summary>
+    private static string WithUnmeasuredExecutability(string answer)
+    {
+        if (Parsed(answer) is not JsonObject o || o["ok"]?.GetValue<bool>() != true) return answer;
+        var convert = o["steps"]?.AsArray()
+            .FirstOrDefault(s => s?["step"]?.GetValue<string>() == "convert");
+        if (convert?["answer"]?["executableNote"]?.GetValue<string>() is not { } unmeasured) return answer;
+        o["note"] = (o["note"]?.GetValue<string>() ?? "") + " NOTHING VOUCHES FOR THIS VI'S WIRING: " +
+                    "the pylabview backend skips NI's validation, and executability was not read - " +
+                    unmeasured;
+        return o.ToJsonString(Indented);
+    }
+
+    private async Task<string> GenerateViCoreAsync(
+        string aiXmlFilePath, string viPath, bool openVI, bool measurePane, int? panePattern,
+        int timeoutSeconds, bool measureDiagram, AixmlBackend.Choice choice, bool cleanUp,
+        bool cleanUpPanel, CancellationToken ct) =>
         await Rpc.GuardAsync(async () =>
         {
             var total = Stopwatch.StartNew();
@@ -176,8 +235,29 @@ internal sealed class BulkTools(LvaiConnection connection)
                 }
             }
 
-            var validate = await aixml.ValidateAixmlAsync(aiXmlFilePath, timeoutSeconds, ct: ct);
-            steps.Add(Step("validate", validate));
+            // THE COMPOSER HAS NO SEPARATE VALIDATION: composing twice would double the cost and
+            // answer the same question. Its refusal comes from the convert step, by name, and the
+            // execution state stands in for NI's type check further down.
+            string validate;
+            if (choice.Name == AixmlBackend.PyLabview)
+            {
+                validate = """{ "errorCode": 0 }""";
+                steps.Add(new JsonObject
+                {
+                    ["step"] = "validate",
+                    ["skipped"] = true,
+                    ["backend"] = choice.Name,
+                    ["note"] = "Not run on the pylabview backend: the composer refuses by name " +
+                               "what it cannot build, at the convert step, and the VI's execution " +
+                               "state is read afterwards in place of NI's wiring check.",
+                });
+            }
+            else
+            {
+                validate = await aixml.ValidateAixmlAsync(aiXmlFilePath, timeoutSeconds,
+                                                          backend: choice.Name, ct: ct);
+                steps.Add(Step("validate", validate));
+            }
 
             // THE LOADED-SUBVI ROUTE. ValidateAIXML refuses a Call to project-local code in EVERY
             // state, while ConvertAIXMLToVI resolves it by name once the target is OPEN in
@@ -227,9 +307,30 @@ internal sealed class BulkTools(LvaiConnection connection)
                 });
             }
 
+            var composed = choice.Name == AixmlBackend.PyLabview;
             var convert = await aixml.ConvertAixmlToViAsync(throwaway?.Path ?? aiXmlFilePath,
-                                                            viPath, openVI, timeoutSeconds, checkExecutable: false, ct: ct);
+                                                            viPath, openVI, timeoutSeconds,
+                                                            checkExecutable: composed,
+                                                            backend: choice.Name, ct: ct);
             steps.Add(Step("convert", convert));
+            if (composed && Failed(convert))
+                return Outcome(false, "convert", steps, total, viPath, null,
+                    (Field(convert, "errorKind") == "composerRefused"
+                        ? "The pylabview composer REFUSED the document, by name, and wrote nothing: "
+                        : "The pylabview composer failed and wrote nothing: ") +
+                    Field(convert, "errorMessage") + ". The composer covers a subset of what NI's " +
+                    "converter does (docs/aixml-backends.md); generate the same document with " +
+                    "backend grpc to compare.");
+            if (composed && Field(convert, "openError") is { Length: > 0 } openError)
+                return Outcome(false, "convert", steps, total, viPath, null,
+                    "THE VI WAS WRITTEN by the pylabview composer and LabVIEW could NOT OPEN it - " +
+                    openError + ". A file LabVIEW refuses to load is broken, not unmeasured; " +
+                    "generate the same document with backend grpc to compare.");
+            if (composed && Parsed(convert)?["executable"]?.GetValue<bool>() == false)
+                return Outcome(false, "convert", steps, total, viPath, null,
+                    "THE VI WAS WRITTEN by the pylabview composer and LabVIEW reports it NOT " +
+                    "executable. The composer does not type-check wiring the way NI's validation " +
+                    "does; generate the same document with backend grpc to have the node named.");
             if (Failed(convert) && unresolved is not null &&
                 RouteFailure(ErrorCode(convert), Field(convert, "errorMessage"),
                              unresolved, throwaway!.ValidatedAs) is { } routeNote)
@@ -353,7 +454,9 @@ internal sealed class BulkTools(LvaiConnection connection)
             {
                 var repair = await PyApplyAsync(
                     viPath, $$"""[{"op":"conpane","pattern":{{pattern}}}]""",
-                    closeProject: true, verify: false, bundleDirectory: null,
+                    // Not on pylabview: closing the project is a gRPC call, and the composed VI
+                    // is not held - ActiveX released it, measured re-read after every rewrite.
+                    closeProject: !composed, verify: false, bundleDirectory: null,
                     timeoutSeconds: timeoutSeconds, ct: ct);
                 steps.Add(Step("panePattern", repair));
                 if (Parsed(repair)?["ok"]?.GetValue<bool>() is not true)
@@ -364,15 +467,42 @@ internal sealed class BulkTools(LvaiConnection connection)
                         "executable. Read the panePattern step.", route);
             }
 
+            // THE CLEAN-UP, after any pane repair - it is a LabVIEW SAVE, and a pylabview rebuild
+            // after it would write under the copy LabVIEW just saved - and before the size, so
+            // diagramSize measures the diagram the caller gets. The user's recommendation of
+            // 2026-10-12, for both backends; a failure leaves the VI as generated and is reported.
+            var cleanNote = "";
+            if (cleanUpPanel && !openVI)
+            {
+                // the FRONT PANEL first, for every VI but the main one (the user's rule of
+                // 2026-10-12); a LabVIEW save like the diagram's, so it too precedes the size
+                var arranged = await (CleanUpPanel?.Invoke(viPath, choice.Name, timeoutSeconds, ct)
+                    ?? new DiagramCleanup(connection).RunPanelAsync(viPath, choice.Name, timeoutSeconds, ct));
+                steps.Add(arranged);
+                if (arranged["ok"]?.GetValue<bool>() != true)
+                    cleanNote += " The front panel was NOT cleaned up - it is as generated: " +
+                                 arranged["note"]?.GetValue<string>();
+            }
+            if (cleanUp && !openVI)
+            {
+                var cleaned = await (CleanUp?.Invoke(viPath, choice.Name, timeoutSeconds, ct)
+                    ?? new DiagramCleanup(connection).RunAsync(viPath, choice.Name, timeoutSeconds, ct));
+                steps.Add(cleaned);
+                if (cleaned["ok"]?.GetValue<bool>() != true)
+                    cleanNote += " The block diagram was NOT cleaned up - the VI is as generated: " +
+                                 cleaned["note"]?.GetValue<string>();
+            }
+
             // THE SIZE, after any pane repair (a render loads the VI, and a pylabview rebuild
             // after that would write under LabVIEW's loaded copy) and before the pane measurement.
             JsonObject? size = null;
             if (measureDiagram)
             {
-                size = await DiagramSizeStepAsync(sourceAixml, viPath, timeoutSeconds, ct);
+                size = await DiagramSizeStepAsync(sourceAixml, viPath, timeoutSeconds, ct,
+                                                  overCom: composed);
                 steps.Add(size);
             }
-            var sizeNote = size?["note"]?.GetValue<string>() ?? "";
+            var sizeNote = (size?["note"]?.GetValue<string>() ?? "") + cleanNote;
 
             if (!measurePane)
                 return Outcome(true, null, steps, total, viPath, null,
@@ -380,9 +510,13 @@ internal sealed class BulkTools(LvaiConnection connection)
                     "false, so nothing here says the terminals are on the right edges." +
                     RouteNote(route) + sizeNote, route, size);
 
-            var verdict = await new PaneTools(connection).MeasureViAsync(
-                viPath, helperViPath: null, helperAixmlPath: null, regenerateHelper: false,
-                timeoutSeconds, ct: ct);
+            // On pylabview the pane is read from the FILE - no LabVIEW at all, and measured to give
+            // the probe's own verdict.
+            var verdict = composed
+                ? await PaneTools.MeasureWithPylabviewAsync(viPath, timeoutSeconds, ct)
+                : await new PaneTools(connection).MeasureViAsync(
+                    viPath, helperViPath: null, helperAixmlPath: null, regenerateHelper: false,
+                    timeoutSeconds, ct: ct);
             steps.Add(new JsonObject
             {
                 ["step"] = "connectorPane",
@@ -398,9 +532,14 @@ internal sealed class BulkTools(LvaiConnection connection)
                     "confirm the terminals are placed correctly. Call lvai_connector_pane " +
                     "yourself to find out why." + RouteNote(route) + sizeNote, route, size);
 
+            // Pattern 0 is the pylabview reading of a VI with NO pane - nothing to breach, and
+            // nothing a caller can wire, which "follows the style guide" would hide.
             return verdict.Clean
                 ? Outcome(true, null, steps, total, viPath, verdict,
-                    "Generated, and the connector pane follows NI's style guide." +
+                    (verdict.Pattern == 0
+                        ? "Generated. It has NO connector pane - no terminal in the AIXML has a " +
+                          "conIdx - so a caller can wire nothing to it."
+                        : "Generated, and the connector pane follows NI's style guide.") +
                     RouteNote(route) + sizeNote, route, size)
                 : Outcome(false, "connectorPane", steps, total, viPath, verdict,
                     "THE VI WAS WRITTEN - generation succeeded. What failed is the connector " +
@@ -415,15 +554,30 @@ internal sealed class BulkTools(LvaiConnection connection)
     /// Shared with lvai_generate_vi_with_events, which builds the main VIs that ran largest.
     /// </summary>
     internal async Task<JsonObject> DiagramSizeStepAsync(string aixmlPath, string viPath,
-                                                         int timeoutSeconds, CancellationToken ct)
+                                                         int timeoutSeconds, CancellationToken ct,
+                                                         bool overCom = false)
     {
         var watch = Stopwatch.StartNew();
         DiagramSize.ChainResult? chain = null;
         try { chain = DiagramSize.Chain(await File.ReadAllTextAsync(aixmlPath, ct)); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        var running = LabViewCom.RunningPids();
         var (measured, png) = await (MeasureDiagram?.Invoke(viPath, timeoutSeconds, ct)
-            ?? new RenderTools(connection).TopLevelSizeAsync(viPath, timeoutSeconds, ct));
+            ?? (overCom
+                ? RenderTools.TopLevelSizeOverComAsync(viPath, timeoutSeconds, ct)
+                : new RenderTools(connection).TopLevelSizeAsync(viPath, timeoutSeconds, ct)));
         var step = DiagramSize.Step(measured, chain);
+        // A RENDER THAT KILLED LabVIEW read as "could not be rendered" beside `ok: true` - the
+        // user's bug report of 2026-10-12, where LabVIEW 2025 died in exactly this step and
+        // nothing in the answer said so.
+        if (measured is null && LabViewCom.AnyGone(running))
+        {
+            step["labviewDied"] = true;
+            step["note"] = " LabVIEW DIED DURING THIS RENDER - a LabVIEW process that ran before " +
+                           "it is gone. The VI is written; every later call needs LabVIEW started " +
+                           "again. Its own log (%TEMP%\\LabVIEW_*_cur.txt) is overwritten on the " +
+                           "next start - copy it first." + step["note"]?.GetValue<string>();
+        }
         step["png"] = png;
         step["elapsedMs"] = watch.ElapsedMilliseconds;
         return step;
@@ -431,6 +585,19 @@ internal sealed class BulkTools(LvaiConnection connection)
 
     /// <summary>Test seam for the render behind `diagramSize`; null in production.</summary>
     internal Func<string, int, CancellationToken, Task<((int Width, int Height)? Size, string? Png)>>? MeasureDiagram
+    {
+        get; init;
+    }
+
+    /// <summary>Test seam for the `cleanUpDiagram` step (viPath, backend); null in production, where
+    /// <see cref="DiagramCleanup"/> runs LabVIEW's own Clean Up Diagram.</summary>
+    internal Func<string, string, int, CancellationToken, Task<JsonObject>>? CleanUp
+    {
+        get; init;
+    }
+
+    /// <summary>Test seam for the `cleanUpPanel` step (viPath, backend); null in production.</summary>
+    internal Func<string, string, int, CancellationToken, Task<JsonObject>>? CleanUpPanel
     {
         get; init;
     }
@@ -691,7 +858,19 @@ internal sealed class BulkTools(LvaiConnection connection)
         [Description("Keep the AIXML sources instead of deleting the ones that succeeded")]
         bool keepAixml = false,
         [Description("Local budget in seconds, per VI")] int timeoutSeconds = 300,
-        CancellationToken ct = default) =>
+        [Description(AixmlBackend.ParameterDescription)] string? backend = null,
+        CancellationToken ct = default)
+    {
+        if (!AixmlBackend.TryResolve(backend, "lvai_generate_vis", out var choice, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
+        return AixmlTools.WithBackend(
+            await GenerateVisCoreAsync(pairsJson, openVI, measurePane, keepAixml, timeoutSeconds,
+                                       choice, ct), choice);
+    }
+
+    private async Task<string> GenerateVisCoreAsync(
+        string pairsJson, bool openVI, bool measurePane, bool keepAixml, int timeoutSeconds,
+        AixmlBackend.Choice choice, CancellationToken ct) =>
         await Rpc.GuardAsync(async () =>
         {
             List<GenerationRequest> requests;
@@ -735,7 +914,8 @@ internal sealed class BulkTools(LvaiConnection connection)
                 }
 
                 var answer = await GenerateViAsync(request.Aixml, request.Vi, openVI, measurePane,
-                                                   request.PanePattern, timeoutSeconds, ct: ct);
+                                                   request.PanePattern, timeoutSeconds, ct: ct,
+                                                   backend: choice.Name);
                 var parsed = Parse(answer);
                 // THE SUB-ANSWER'S OWN VERDICT, NOT `viExistsNow`. That field is true for a file
                 // some EARLIER run left behind, so a batch over targets that already existed
@@ -945,8 +1125,9 @@ internal sealed class BulkTools(LvaiConnection connection)
             would break the one workflow this tool exists to serve.
             """)]
         bool gateOnExecState = true,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "pylv_apply", async () =>
         {
             if (!File.Exists(viPath))
                 return Json.Error("badArguments", $"No file at viPath '{viPath}'.");
@@ -1093,7 +1274,7 @@ internal sealed class BulkTools(LvaiConnection connection)
                     : "Rebuilt. NOTHING HERE CONFIRMS THE EDIT - verify was false, so LabVIEW has " +
                       "not read the file back, and its executability was not measured either. " +
                       "Export it yourself before believing this.");
-        });
+        }));
 
     /// <summary>
     /// The close, as a step rather than a precondition. An unreachable LabVIEW is reported as a
@@ -1134,7 +1315,7 @@ internal sealed class BulkTools(LvaiConnection connection)
 
         var answer = await new AixmlTools(connection).ConvertViToAixmlAsync(
             viPath, exportPath, returnContent: false, maxContentChars: 0, timeoutSeconds,
-            refresh: true, ct);
+            refresh: true, ct: ct);
 
         var targets = new JsonArray();
         if (File.Exists(exportPath))
@@ -1225,7 +1406,9 @@ internal sealed class BulkTools(LvaiConnection connection)
     internal static bool ContainsCompiledCode(string viPath)
     {
         if (!File.Exists(viPath)) return false;
-        return File.ReadAllBytes(viPath).AsSpan().IndexOf("VICD"u8) >= 0;
+        // The file's OWN resource map, not its bytes: a caller of a .vim embeds each instance as a
+        // whole VI with its own VICD (RsrcMap).
+        return RsrcMap.Lists(File.ReadAllBytes(viPath), "VICD");
     }
 
     private static string PyOutcome(bool ok, string? failedAt, JsonArray steps, Stopwatch total,

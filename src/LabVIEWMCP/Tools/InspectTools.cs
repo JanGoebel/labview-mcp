@@ -34,9 +34,27 @@ internal sealed class InspectTools(LvaiConnection connection)
         [Description("Local budget in seconds")] int timeoutSeconds = 120,
         [Description("Truncate each message's infoJson to this many characters (0 = unlimited)")]
         int maxContentChars = 0,
+        [Description(AixmlBackend.ParameterDescription + """
+             On pylabview the answer is built from the FILE by our reader, in the same shape and
+            with NI's keys: viXml is the reader's AIXML, controlsIndicators and subvisInfo are read
+            from it, owningProjectPath is the nearest .lvproj listing the VI itself; viImage stays
+            empty (`warnings` says so). No running LabVIEW is needed.
+            """)]
+        string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_describe_vi", async () =>
         {
+            if (BackendRoute.OnPyLabview)
+            {
+                if (!File.Exists(viPath))
+                    return Json.Error("viNotFound", $"No file at '{viPath}'.", new { viPath });
+                var (aixml, code, message) = await BackendRoute.ExportAsync(
+                    connection, viPath, "describe-vi", timeoutSeconds, ct);
+                return FileDescriptions.Envelope(
+                    FileDescriptions.DescribeVi(viPath, aixml, code, aixml is null ? message : ""),
+                    maxMessages, maxContentChars);
+            }
+
             // Opened AND drained inside InvokeAsync so a stale channel is re-discovered: a
             // stream cannot be handed a client up front and survive a LabVIEW restart. Safe to
             // retry because this is a read.
@@ -55,7 +73,7 @@ internal sealed class InspectTools(LvaiConnection connection)
                 // as one string - so that is the field a context budget has to be able to cap.
                 return Json.Stream(items, reason, maxMessages, maxContentChars, "infoJson");
             }, ct);
-        });
+        }));
 
     [McpServerTool(Name = "lvai_vi_terminals", ReadOnly = true,
                    Title = "Terminal names a Call to this VI needs")]
@@ -85,12 +103,30 @@ internal sealed class InspectTools(LvaiConnection connection)
         example - `Voltage - Finite Input.vi` - yielded every terminal name AND both polymorphic
         instance names at once. That is the documented route for any library-owned VI, not a
         workaround.
+        ON THE pylabview BACKEND the export is our own reader's (vi2aixml.py) - no LabVIEW and no
+        NI service at all - and it is never cached and never served from the cache, which holds
+        NI's converter output only. The answer's last line names `backend` and `backendSource`.
         """)]
     public async Task<string> ViTerminalsAsync(
         [Description(@"Absolute path to the .vi whose terminals you need")] string viPath,
         [Description("Re-export even when a cached export exists")] bool refresh = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 180,
-        CancellationToken ct = default) =>
+        [Description(AixmlBackend.ParameterDescription)] string? backend = null,
+        CancellationToken ct = default)
+    {
+        if (!AixmlBackend.TryResolve(backend, "lvai_vi_terminals", out var choice, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
+        return AixmlBackend.Named(await ViTerminalsCoreAsync(viPath, refresh, timeoutSeconds,
+                                                             choice, ct), choice);
+    }
+
+    /// <summary>
+    /// The body of <see cref="ViTerminalsAsync"/> once the backend is settled. On pylabview the
+    /// export is the READER's and NI's service is never asked - the Caraya agent's two terminal
+    /// lookups were the calls that kept a "pylabview" build from being NI-free (2026-10-12).
+    /// </summary>
+    private async Task<string> ViTerminalsCoreAsync(string viPath, bool refresh, int timeoutSeconds,
+                                                     AixmlBackend.Choice choice, CancellationToken ct) =>
         await Rpc.GuardAsync(async () =>
         {
             if (!File.Exists(viPath))
@@ -103,13 +139,19 @@ internal sealed class InspectTools(LvaiConnection connection)
                 $"terminals-{Path.GetFileNameWithoutExtension(viPath)}.xml");
             Directory.CreateDirectory(CacheDirectory.Scratch);
 
+            // THE READER NEITHER READS NOR WRITES THE EXPORT CACHE. It holds NI's converter output,
+            // and lvai_convert_vi_to_aixml on pylabview keeps the same rule: a reader export stored
+            // there would later be served as NI's, and an NI export served here would be an answer
+            // the backend asked for did not give.
+            var composed = choice.Name == AixmlBackend.PyLabview;
+
             // Through the export cache, both ways. This tool used to call the RPC directly and so
             // never touched the cache at all - measured by watching the cache directory during a
             // VI-generator run: the run produced no entries, because a terminal lookup was the only
             // export it did. That is backwards. A palette VI's terminals are the single most
             // repeated read in the whole workflow - every generator run looks up the same handful -
             // and it was the one read paying a full LabVIEW export every time.
-            var fromCache = !refresh && AixmlExportStore.TryCopyTo(viPath, scratch);
+            var fromCache = !composed && !refresh && AixmlExportStore.TryCopyTo(viPath, scratch);
 
             // Where the export came from, in the caller's words rather than only in the file
             // timestamps. Three VI-generator runs reported this omission independently - the tool
@@ -119,7 +161,25 @@ internal sealed class InspectTools(LvaiConnection connection)
             // about everything else, so it does not get to stand here.
             string provenance;
 
-            if (fromCache)
+            if (composed)
+            {
+                if (AixmlComposer.Locate(out var missing) is not { } setup)
+                    return Json.Error("backendNotAvailable", missing, new { viPath });
+
+                var read = await AixmlComposer.ReadAsync(setup, viPath, scratch, timeoutSeconds, ct);
+                if (!read.Written)
+                    return Json.Error("exportFailed",
+                        $"vi2aixml.py could not read '{viPath}': {read.Message}",
+                        new { viPath, readerExitCode = read.ExitCode });
+
+                provenance = "Read by vi2aixml.py, the pylabview backend's reader - NOT by NI's " +
+                             "converter, and no LabVIEW was asked. Never cached: the export cache " +
+                             "holds NI's output only" +
+                             (refresh ? ", so refresh changes nothing here." : ".") +
+                             " A terminal name that differs from NI's export is the reader's until " +
+                             "shown otherwise.";
+            }
+            else if (fromCache)
             {
                 provenance = AixmlExportStore.CachedUtc(viPath) is { } taken
                     ? $"Export served from the cache, taken {taken:yyyy-MM-dd HH:mm}Z - no LabVIEW " +
@@ -184,9 +244,21 @@ internal sealed class InspectTools(LvaiConnection connection)
         [Description("Optional project name; usually leave empty")] string? projectName = null,
         [Description("Max stream messages to collect")] int maxMessages = 10,
         [Description("Local budget in seconds")] int timeoutSeconds = 120,
+        [Description(AixmlBackend.ParameterDescription + """
+             On pylabview the answer is read from the .lvproj and the .lvlib files it lists, in
+            NI's shape: targets with their libraries (every item with its effective scope),
+            classes, VIs, other files, missing files and build specifications. A target's address
+            is not in the file and stays empty (`warnings` says so). No running LabVIEW is needed.
+            """)]
+        string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_describe_project", async () =>
         {
+            if (BackendRoute.OnPyLabview)
+                return File.Exists(projectPath)
+                    ? FileDescriptions.Envelope(FileDescriptions.DescribeProject(projectPath), maxMessages)
+                    : Json.Error("fileNotFound", $"No .lvproj at '{projectPath}'.", new { projectPath });
+
             return await connection.InvokeAsync(async (client, t) =>
             {
                 using var call = client.GetDescribeProjectPromptInfo(
@@ -200,7 +272,7 @@ internal sealed class InspectTools(LvaiConnection connection)
                     call.ResponseStream, maxMessages, timeoutSeconds, t);
                 return Json.Stream(items, reason, maxMessages);
             }, ct);
-        });
+        }));
 
     [McpServerTool(Name = "lvai_search_info_cache", ReadOnly = true, Title = "Search the LabVIEW info cache")]
     [Description("""

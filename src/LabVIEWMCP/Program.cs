@@ -64,6 +64,24 @@ if (CommandLine.StringArg(args, "--lvversion") is { Length: > 0 } wantedVersion)
     LabViewVersionStamp.SetOverride(release);
 }
 
+// Refused here rather than at the first tool call, for the same reason as --lvversion above: a
+// misspelt backend that quietly fell back to grpc would answer a question nobody asked.
+if (CommandLine.StringArg(args, AixmlBackend.Flag) is { Length: > 0 } wantedBackend)
+{
+    if (AixmlBackend.NormaliseSetting(wantedBackend) is not { } backendName)
+    {
+        Console.Error.WriteLine(
+            $"{AixmlBackend.Flag} '{wantedBackend}' is not one of: {string.Join(", ", AixmlBackend.SettingNames)}.");
+        return 2;
+    }
+    AixmlBackend.SetFromCommandLine(backendName);
+}
+
+// The settings file carries the backend choice with every allowed value explained beside it - the
+// user's decision of 2026-10-13. Created on the first start, never rewritten: from then on it is
+// the user's file. A profile that cannot be written does not stop the server.
+ServerSettings.EnsureExists();
+
 if (CommandLine.HasFlag(args, "--selftest"))
     return await SelfTest.RunAsync(
         portOverride, CommandLine.StringArg(args, "--vi"), CommandLine.StringArg(args, "--project"));

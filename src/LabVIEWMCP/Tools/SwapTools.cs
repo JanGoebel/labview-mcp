@@ -163,11 +163,20 @@ internal sealed class SwapTools(LvaiConnection connection)
             """)]
         string? editsJson = null,
         [Description("Local budget in seconds, per step")] int timeoutSeconds = 300,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
+        [Description("""
+            Run LabVIEW's own Clean Up Diagram on each VI after a successful swap and save it in
+            place (the cleanUpDiagram field) - a Replace keeps each node's position while its size
+            and terminals change. Reported, never gating; a DQMH module's Main.vi is never touched.
+            """)]
+        bool cleanUpDiagram = true)
     {
+        if (!AixmlBackend.TryResolve(backend, "lvai_swap_subvis", out _, out var badBackend))
+            return AixmlBackend.Refusal(badBackend);
         if (editsJson is { Length: > 0 })
             return await ManyAsync(editsJson, verify, verbose, helperViPath, helperAixmlPath,
-                                   regenerateHelper, timeoutSeconds, ct: ct);
+                                   regenerateHelper, timeoutSeconds, cleanUpDiagram, ct: ct);
 
         // Now that `viPath` is optional in the schema, its absence has to be caught here - and
         // named, rather than arriving as a null-reference somewhere further down.
@@ -176,8 +185,29 @@ internal sealed class SwapTools(LvaiConnection connection)
                 "Give either `viPath` (one VI) or `editsJson` (several). Neither arrived.",
                 new { viPath, editsJson });
 
-        return await OneAsync(viPath, swapsJson, constantsJson, verify, verbose, helperViPath,
-                              helperAixmlPath, regenerateHelper, timeoutSeconds, ct: ct);
+        return await OneAndCleanAsync(viPath, swapsJson, constantsJson, verify, verbose, helperViPath,
+                                      helperAixmlPath, regenerateHelper, timeoutSeconds,
+                                      cleanUpDiagram, ct: ct);
+    }
+
+    /// <summary>
+    /// One swap, then LabVIEW's Clean Up Diagram on the saved VI when the swap was ok. The clean-up
+    /// is added to the answer as `cleanUpDiagram` and never changes its `ok`.
+    /// </summary>
+    private async Task<string> OneAndCleanAsync(string viPath, string? swapsJson, string? constantsJson,
+                                                bool verify, bool verbose, string? helperViPath,
+                                                string? helperAixmlPath, bool regenerateHelper,
+                                                int timeoutSeconds, bool cleanUpDiagram,
+                                                CancellationToken ct)
+    {
+        var answer = await OneAsync(viPath, swapsJson, constantsJson, verify, verbose, helperViPath,
+                                    helperAixmlPath, regenerateHelper, timeoutSeconds, ct: ct);
+        if (!cleanUpDiagram || Read(answer) is not JsonObject node
+            || node["ok"]?.GetValue<bool>() is not true)
+            return answer;
+        node["cleanUpDiagram"] = await new DiagramCleanup(connection).RunAsync(
+            viPath, BackendRoute.Current, timeoutSeconds, ct);
+        return Json.Document(node);
     }
 
     /// <summary>
@@ -191,7 +221,7 @@ internal sealed class SwapTools(LvaiConnection connection)
     private async Task<string> ManyAsync(string editsJson, bool verify, bool verbose,
                                          string? helperViPath, string? helperAixmlPath,
                                          bool regenerateHelper, int timeoutSeconds,
-                                         CancellationToken ct)
+                                         bool cleanUpDiagram, CancellationToken ct)
     {
         JsonNode? parsed;
         try { parsed = JsonNode.Parse(editsJson); }
@@ -229,9 +259,9 @@ internal sealed class SwapTools(LvaiConnection connection)
         string? stoppedAt = null;
         foreach (var edit in edits)
         {
-            var one = await OneAsync(edit.Vi, edit.Swaps, edit.Constants, verify, verbose,
-                                     helperViPath, helperAixmlPath, regenerateHelper,
-                                     timeoutSeconds, ct: ct);
+            var one = await OneAndCleanAsync(edit.Vi, edit.Swaps, edit.Constants, verify, verbose,
+                                             helperViPath, helperAixmlPath, regenerateHelper,
+                                             timeoutSeconds, cleanUpDiagram, ct: ct);
             var node = Read(one);
             answers.Add(new JsonObject { ["vi"] = edit.Vi, ["answer"] = node });
 
@@ -252,7 +282,7 @@ internal sealed class SwapTools(LvaiConnection connection)
             ["edits"] = answers,
             ["elapsedMs"] = elapsed.ElapsedMilliseconds,
             ["note"] = stoppedAt is null
-                ? "Every VI was swapped and verified against LabVIEW's own export."
+                ? $"Every VI was swapped and verified against {AixmlBackend.ExportName()}."
                 : $"Stopped at '{Path.GetFileName(stoppedAt)}'. The {written} VI(s) before " +
                   "it are already SAVED - they were swapped successfully. That one and " +
                   "everything after it still call their sockets, so the suite tests nothing.",
@@ -316,7 +346,7 @@ internal sealed class SwapTools(LvaiConnection connection)
                     "folder lvai_status reports as scriptsDirectory). Pass helperAixmlPath.");
 
             var helperVi = Path.GetFullPath(helperViPath ?? Path.Combine(
-                Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvai_swap_subvis.vi"));
+                AixmlBackend.HelperFolder(), "lvai_swap_subvis.vi"));
             if (Path.GetDirectoryName(helperVi) is { Length: > 0 } directory)
                 Directory.CreateDirectory(directory);
 
@@ -369,7 +399,7 @@ internal sealed class SwapTools(LvaiConnection connection)
                 Directory.CreateDirectory(Path.GetDirectoryName(beforePath)!);
                 var beforeExport = await new AixmlTools(connection).ConvertViToAixmlAsync(
                     viPath, beforePath, returnContent: true, maxContentChars: 0, timeoutSeconds,
-                    refresh: true, ct);
+                    refresh: true, ct: ct);
                 if ((Parse(beforeExport) as JsonObject)?["xml"]?.GetValue<string>() is { } beforeXml)
                     wiringBefore = WiringByUid(beforeXml);
 
@@ -435,7 +465,7 @@ internal sealed class SwapTools(LvaiConnection connection)
                 var verifyWall = Stopwatch.StartNew();
                 var exported = await new AixmlTools(connection).ConvertViToAixmlAsync(
                     viPath, exportPath, returnContent: true, maxContentChars: 0, timeoutSeconds,
-                    refresh: true, ct);
+                    refresh: true, ct: ct);
                 steps.Add(new JsonObject
                 {
                     ["step"] = "verify",
@@ -575,13 +605,13 @@ internal sealed class SwapTools(LvaiConnection connection)
                    "`Centrifugal Pump.lvclass:Read Last Event.vi`, not `Read Last Event.vi` - " +
                    "which is what a second swap over the same diagram has to use." + onDiagram;
         if (socketsLeft > 0)
-            return $"{socketsLeft} socket name(s) are STILL in LabVIEW's own export of the VI, so " +
+            return $"{socketsLeft} socket name(s) are STILL in {AixmlBackend.ExportName()} of the VI, so " +
                    "that many ENTRIES did not land. IT IS NOT A NODE COUNT: it counts swapsJson " +
                    "entries still present in the export, so one entry naming a repeated socket " +
                    "reads 1 until the LAST node is swapped. `diagramSubVis` lists the diagram's " +
                    "names with repetition and is the per-node view." + onDiagram;
         return verify
-            ? "Swapped, and verified against LabVIEW's own export: no socket name survives in "
+            ? $"Swapped, and verified against {AixmlBackend.ExportName()}: no socket name survives in "
               + "it, and `callTargets` is what the diagram now calls. `wiringLost` is REPORTING "
               + "ONLY and nothing branches on it - it gated `ok` for one day and produced false "
               + "negatives on three runs, because a uid is not stable across `Replace` when "

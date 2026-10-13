@@ -128,8 +128,9 @@ internal sealed class TypedefTools(LvaiConnection connection)
         [Description("Regenerate the helper VI even when it already exists")]
         bool regenerateHelper = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_bind_typedef_constants", async () =>
         {
             if (!File.Exists(viPath))
                 throw new FileNotFoundException($"No VI at '{viPath}'.", viPath);
@@ -162,7 +163,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
                 Directory.CreateDirectory(directory);
 
             var helperGenerated = false;
-            if (regenerateHelper || !File.Exists(helperVi))
+            if (regenerateHelper || HelperCache.NeedsRebuild(aixml, helperVi))
             {
                 if (await GenerateHelperAsync(aixml, helperVi, timeoutSeconds, ct: ct)
                     is { } failure) return failure;
@@ -201,7 +202,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
 
             return Describe(answers, wanted, viPath, subViName, helperVi, aixml, helperGenerated,
                             before, after);
-        });
+        }));
 
     /// <summary>
     /// Turn the per-terminal helper runs into this tool's answer. Kept apart from the RPC work so
@@ -433,7 +434,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
             if (!File.Exists(aixml)) return null;
 
             var helperVi = Path.Combine(
-                Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvbd_pane_typedefs.vi");
+                AixmlBackend.HelperFolder(), "lvbd_pane_typedefs.vi");
             if (Path.GetDirectoryName(helperVi) is { Length: > 0 } directory)
                 Directory.CreateDirectory(directory);
 
@@ -521,8 +522,9 @@ internal sealed class TypedefTools(LvaiConnection connection)
         [Description("Regenerate the helper VI even when it already exists")]
         bool regenerateHelper = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_coercion_dots", async () =>
         {
             if (!File.Exists(viPath))
                 throw new FileNotFoundException($"No VI at '{viPath}'.", viPath);
@@ -585,7 +587,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
                 answers.Add((node.Name, node.Index, await RunFor(node.Index)));
 
             return DescribeDots(answers, viPath, helperVi, aixml, helperGenerated);
-        });
+        }));
 
     /// <summary>
     /// Turn the per-subVI helper runs into this tool's answer. Separated from the RPC work so the
@@ -925,8 +927,9 @@ internal sealed class TypedefTools(LvaiConnection connection)
         string? helperAixmlPath = null,
         [Description("Regenerate the helper VI even when it exists")] bool regenerateHelper = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_bind_pane_typedef", async () =>
         {
             if (!File.Exists(viPath)) return Json.Error("badArguments", $"No .vi at '{viPath}'.");
             if (!File.Exists(lvclassPath))
@@ -951,14 +954,14 @@ internal sealed class TypedefTools(LvaiConnection connection)
                 throw new FileNotFoundException($"No helper AIXML at '{aixml}'.", aixml);
 
             var helperVi = Path.GetFullPath(helperViPath ??
-                Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers",
+                Path.Combine(AixmlBackend.HelperFolder(),
                              "lvai_bind_pane_typedef.vi"));
             if (Path.GetDirectoryName(helperVi) is { Length: > 0 } directory)
                 Directory.CreateDirectory(directory);
 
             var steps = new JsonArray();
             var helperGenerated = false;
-            if (regenerateHelper || !File.Exists(helperVi))
+            if (regenerateHelper || HelperCache.NeedsRebuild(aixml, helperVi))
             {
                 if (await GenerateHelperAsync(aixml, helperVi, timeoutSeconds, ct: ct)
                     is { } failure) return failure;
@@ -1015,7 +1018,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
             return DescribePaneBind(answer, bindings, viPath, lvclassPath, helperVi, aixml,
                                     helperGenerated, retried, steps,
                                     await TypedefCtlNamesOnDiskAsync(viPath, timeoutSeconds, ct));
-        });
+        }));
 
     /// <summary>
     /// The pane-bind verdict, kept apart from the RPC work so the part that decides `ok` is
@@ -1144,8 +1147,9 @@ internal sealed class TypedefTools(LvaiConnection connection)
         string? helperAixmlPath = null,
         [Description("Regenerate the helper VI even when it exists")] bool regenerateHelper = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
+        [Description(AixmlBackend.RouteParameterDescription)] string? backend = null,
         CancellationToken ct = default) =>
-        await Rpc.GuardAsync(async () =>
+        await Rpc.GuardAsync(() => BackendRoute.WithBackendAsync(backend, "lvai_resave_ctl", async () =>
         {
             if (!File.Exists(ctlPath)) return Json.Error("badArguments", $"No file at '{ctlPath}'.");
             if (Path.GetExtension(ctlPath) is not ".ctl")
@@ -1163,13 +1167,13 @@ internal sealed class TypedefTools(LvaiConnection connection)
                 throw new FileNotFoundException($"No helper AIXML at '{aixml}'.", aixml);
 
             var helperVi = Path.GetFullPath(helperViPath ??
-                Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvai_resave_ctl.vi"));
+                Path.Combine(AixmlBackend.HelperFolder(), "lvai_resave_ctl.vi"));
             if (Path.GetDirectoryName(helperVi) is { Length: > 0 } directory)
                 Directory.CreateDirectory(directory);
 
             var steps = new JsonArray();
             var helperGenerated = false;
-            if (regenerateHelper || !File.Exists(helperVi))
+            if (regenerateHelper || HelperCache.NeedsRebuild(aixml, helperVi))
             {
                 if (await GenerateHelperAsync(aixml, helperVi, timeoutSeconds, ct: ct)
                     is { } failure) return failure;
@@ -1224,7 +1228,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
                       "not open and active the helper reached nothing; Error 1055 in the resave " +
                       "step says so.",
             });
-        });
+        }));
 
     /// <summary>
     /// <c>lvai_describe_ctl</c>'s verdict for one file, as a JsonObject - no LabVIEW, no RPC.
@@ -1293,7 +1297,7 @@ internal sealed class TypedefTools(LvaiConnection connection)
             : null;
 
     private static string DefaultDotsHelperViPath() =>
-        Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvbd_coercion_dots.vi");
+        Path.Combine(AixmlBackend.HelperFolder(), "lvbd_coercion_dots.vi");
 
     /// <summary>
     /// The helper's inputs. `subvi name` is OMITTED rather than passed empty, because the runner
@@ -1397,6 +1401,14 @@ internal sealed class TypedefTools(LvaiConnection connection)
     private async Task<string?> GenerateHelperAsync(
         string aixml, string helperVi, int timeoutSeconds, CancellationToken ct)
     {
+        // ON PYLABVIEW the helper is COMPOSED, into the path the caller chose - which
+        // AixmlBackend.HelperFolder() already puts in helpers-pylabview on that route
+        if (BackendRoute.OnPyLabview)
+            return await BackendRoute.ConvertAsync(connection, aixml, helperVi, timeoutSeconds, ct)
+                is { } refused
+                ? Json.Error("helperNotComposable", refused, new { aiXmlPath = Path.GetFullPath(aixml) })
+                : null;
+
         var validation = await connection.InvokeAsync((c, t) =>
             c.ValidateAIXMLAsync(new ValidateAIXMLRequest { AiXMLFilePath = aixml },
                 deadline: Rpc.Deadline(timeoutSeconds), cancellationToken: t).ResponseAsync, ct);
@@ -1447,5 +1459,5 @@ internal sealed class TypedefTools(LvaiConnection connection)
     /// %LOCALAPPDATA% with the directory present and writable, while %TEMP% accepts it.
     /// </summary>
     private static string DefaultHelperViPath() =>
-        Path.Combine(Path.GetTempPath(), "LabVIEWMCP", "helpers", "lvbd_bind_constant.vi");
+        Path.Combine(AixmlBackend.HelperFolder(), "lvbd_bind_constant.vi");
 }

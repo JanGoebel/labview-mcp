@@ -529,6 +529,29 @@ come back ready to paste. `ok: false` with `failedAtStep: connectorPane` still m
 written** — it is the pane that needs another pass, not the diagram. Measured 2026-08-25: 1.1 s for
 the whole sequence against three round trips. `docs/bulk-operations.md`.
 
+**AND IT RUNS LabVIEW's OWN CLEAN UP DIAGRAM ON EVERY DELIVERABLE, on both backends - the user's
+recommendation of 2026-10-12.** `{LV.VI}` `BD.CleanUp` then `Save.Instrument`, the two calls NI's
+Message Maker makes, through `scripts\lvai_cleanup_diagram.xml`; before `diagramSize`, so the size
+is the diagram the caller gets. `cleanUpDiagram` follows `measureDiagram` when omitted, so helpers
+and carriers skip it; `lvai_generate_vi_with_events` and `lvai_wire_dynamic_events` clean up at
+their successful end. A save that brings compiled code into a source-only VI is stripped again. A
+failed clean-up is reported in the `cleanUpDiagram` step and does not fail the call. **Since
+2026-10-13 the routes that convert past `lvai_generate_vi` clean up too** - `lvai_add_class_method`
+and `lvai_lunit_add_test_method` after the verified membership, `lvai_swap_subvis` after a good
+swap (a `Replace` keeps positions while sizes change), `lvai_make_malleable` on its intermediate;
+each takes `cleanUpDiagram` (default true). **THE DQMH TOOLS NEVER CLEAN UP, and a DQMH module's
+`Main.vi` is skipped by `DiagramCleanup` itself on every route** - the user's rule of the same day.
+
+**AND THE FRONT PANEL OF EVERY VI THAT IS NOT THE MAIN VI GOES THROUGH CLEAN UP PANEL - the user's
+rule of the same day.** `cleanUpPanel` in `lvai_generate_vi`, default as `cleanUpDiagram`; pass
+`false` for the application's main VI, whose panel is the user interface. The IDE's own plugin
+(`resource\plugins\Call Clean Up Panel.vi`) chooses between Nigel and an algorithm IN A DIALOG, so
+`scripts\lvai_cleanup_panel.xml` calls the algorithm directly - `Arrange VIWin - Arrange FP.vi` under
+`resource\dialog\QuickDrop`, by path - and first counts tab controls and splitters, on which that
+algorithm opens a MODAL One Button Dialog; such a panel is left alone and reported `skipped`.
+Measured on both backends: arranged and source-only, and NI's tab-control example left
+byte-identical with no dialog.
+
 **When any output is not a string, run it with `lvai_run_vi_and_read_values` instead.** That is
 almost every real VI: a boolean, a cluster, an array or a waveform all come back blank from the
 plain call. The tool sets the inputs, runs the target and reads every control and indicator back
@@ -734,6 +757,15 @@ in the optional half; and a node-specific comment left unplaced is the one combi
 manufactures confident, wrong documentation. **Fewer and shorter wins twice**: the run that cut back
 to one comment per diagram was both the fastest (570 s against 776 s) and the one that placed most
 cleanly, because a small box has more positions clear of its neighbours.
+
+**A COMMENT ABOUT A LOOP OR A FRAME GOES INTO ITS SUBDIAGRAM LABEL, which needs no placement -
+the user's request of 2026-10-12.** `label="…"` on the `<Structure>` (While, For, In Place), the
+`<CaseFrame>` (Case, Event) or the `<Diagram>` (Flat Sequence, Disable) is the structure's
+Subdiagram Label, drawn across the top of exactly that loop or frame - NI's exporter writes it,
+NI's converter and the composer both read it, 805 of them in the cached NI exports. NI's
+converter keeps the structure at its own size and CLIPS a label wider than it; the composer
+widens the structure and wraps. So a node-free statement about the diagram stays a `<FreeLabel>`,
+and what one iteration or one case does goes into `label=`. `docs/aixml-reference.md` §7.
 
 **A diagram comment authored in AIXML lands somewhere the generator chooses, not on the node you
 meant.** AIXML has no coordinate attribute at all, so `<FreeLabel>` can only be *created* there.
@@ -1094,6 +1126,112 @@ pylabview cannot author a VI from nothing. **AIXML creates and names; pylabview 
 | a `.ctl`, an icon, layout, decorations | pylabview. NI's list puts `.ctl` outside the generator entirely |
 | a class, its private data, an accessor | **neither — call NI's OWN provider VIs**, see below |
 | a DQMH module, or anything a vendor toolkit under `project\` scripts | **neither — VI Server BY PATH**, see below |
+
+**THE AIXML TOOLS HAVE TWO BACKENDS SINCE 2026-10-10 - NI's gRPC service and our own pylabview
+composer - and the user's choice was to keep BOTH and switch, not replace.** `lvai_validate_aixml`,
+`lvai_convert_aixml_to_vi`, `lvai_convert_vi_to_aixml`, `lvai_generate_vi` and `lvai_generate_vis`
+take `backend`; without it the server default applies (`--aixml-backend`, then
+`LABVIEWMCP_AIXML_BACKEND`, then **`"aixmlBackend"` in `%USERPROFILE%\.labviewmcp\settings.json`** -
+the user's place to choose since 2026-10-13, created on the first start with every value explained
+in it, `grpc`, `pylabview` or `auto` - then `grpc`), and **only to a tool the client itself called** - the
+forty-odd internal callers (class tools, test generators, graft) depend on what only NI's
+converter does, so they stay on `grpc`. Every answer names `backend` and `backendSource`. On
+`pylabview` a validation is a scratch COMPOSE, not NI's wiring check. **What needs a RUNNING
+LabVIEW goes over its ActiveX server instead of Nigel** (`Infra/LabViewCom.cs`, since the same
+day): executability, `lvai_run_vi_and_read_values`, the diagram render - and `lvai_exec_state` and
+that run tool take `backend` too. ActiveX ATTACHES ONLY, never starts LabVIEW (one started by COM
+quits when the call ends and leaves an invisible dialog), never runs a broken VI, and runs with a
+deadline and an Abort; it has no Value (Signaling), and no linker-error property - `lvai_exec_state`
+names them anyway, through its own helper composed and run over ActiveX (2026-10-12). Measured against NI's
+helpers: the same states, 11 of 11 runs right, 0.02 s per state read. The pane is read from the
+FILE by `pylv-conpane.py`, matching NI's probe. **The server's own HELPER VIs are NOT yet on this
+route**: measured over the `scripts` documents, the composer builds 9 with the parts as committed and
+31 with parts harvested from the NI-built helpers - one property, `Application` on `{LV.Project}`,
+blocked 28 - 39 of 82 after the repairs, 70 after the typedef and control-reference work, and
+**78 of 82 - all executable, 12 of 12 output-identical to NI's, every helper a tool runs and the
+user-event skeleton - after the remaining blockers**, recorded in FINDINGS §7a, with the composer's
+own suite at 147 of 148 cases (`VI Activation` fires only with the desktop's focus) - control references as event sources, frames handling several events,
+static mouse events, the events only a graph has and filter events with their Event Filter Node
+included (a filter frame WITHOUT that node is broken, so the composer adds one; several filter events
+share a frame only where LabVIEW's own load accepts it - the same event, or identical data and
+reference class - and the rest is refused by name), the VI's own
+Panel Close? and Key Down? FIRED FOR REAL by a window message to the panel; a control's Key Down?
+composes and fires, but nothing that needs a control's KEY FOCUS is reproducible from a message -
+it follows the desktop's active window. The application's events and the notify key events came
+from a pylabview scan of LabVIEW's OWN VIs (`resource\`), where NI's cached exports had none -
+**when the examples have no instance of a construct, scan the installation before guessing a
+number**: the guessed Key Up number came back from NI's exporter as Panel Close. **An XControl
+FACADE composes** when its `_name` is `<X>.xctl:<Facade>.vi`, the XControl events with it - but
+AIXML has no terminal for an Event Structure's TIMEOUT, so a facade returns only if every XControl
+event's frame ends its loop: NI's facade composed as exported waited for ever and the XControl's
+method answered 0 where NI's answers 212, which only a run with the HOST's panel open showed. And a
+loaded XControl is served from memory for ANY path with its qualified name - `lv-com.ps1` says
+`SERVED FROM` now. **Menu references compose too**, between primitives and out of a Shortcut Menu
+Activation? frame's event data, the latter run with a real right-click - LabVIEW's popup menu is
+its own window class `LVMenuWnd`. **A library member called by its bare name is linked under its
+FULL qualified name** (the callee's `LIBN`): bare, LabVIEW relinked the call on load and the repair
+of OTHER wires failed (`Bad edge`, `Cannot find terminal hotpoint`). `LinkSaveFlag 2` hid that on
+one fixture and KILLED LabVIEW on an ordinary call - a fix tried on one fixture is not a fix until
+the suite ran. And a DWarn check on a file LabVIEW already loaded once sees nothing: the second load
+comes from its compiled-object cache. **The composer writes REAL wire geometry**: a terminal
+attaches at the centre of its rectangle (27 232 wires of LabVIEW's own examples, per-primitive
+offsets learned), and its layout no longer puts a node behind its source, so LabVIEW's load-time
+wire repairs fell from 362 to 96 over 20 VIs - the noise that used to fill its log and blind the
+insanity check. **Fan-outs too, down to 28, and to 12 with LabVIEW's own `termHotPoint` per DCO**: a wire of three or more ends is a depth-first TREE in
+the heap, written as a comb only where every end's hotpoint is EXACT - learned from LabVIEW's own
+fan-outs, NI's examples plus the suite composed with generic tables and saved by LabVIEW, the only
+corpus with a loop's `i` or a dynamic event terminal in one; constants follow a calibration, since
+LabVIEW sizes its own to their text. **THE WHOLE CLD ATM EXAM WENT THROUGH THE COMPOSER on
+2026-10-11** - 21 application VIs, 18 Caraya test VIs and two runners, all composed and run over
+ActiveX, 83 assertions green, in about an hour with agents, `C:\Temp\ATM_Pylab`. The gaps it
+found were closed that night - comments, descriptions, a bare name resolving NI's namesake first,
+`Label.Text` on a control, queue and file refnum wires, a property tabled under its short name,
+wide fan-outs, constants stacked into one tall column, five unnamed terminals - and a queue
+refnum as a subVI terminal the next night (`ref{Queue}{string}`, a container like an array),
+typed control refnums (`ref{LV.String}`: the TYPE is the plain class refnum, only the panel
+object nests one of the control's class), notifier wires and `Update While Typing?` - whose row
+came from LabVIEW's own VIs through a pylabview scan of `resource\` (`scan_props.py`), because a
+row from NI's build of our own AIXML is not committed; FINDINGS §7a.
+**No `.ctl` link
+is needed for a typedef - NI's converter writes none either**; what broke the typedef helpers was the typedef's
+inner type ids, copied from the donor VI unresolved, and the FATAL aborts once blamed on typedefs
+were a subVI input and output with one label sharing a terminal and two terminals on one `conIdx`. **A CLASS,
+AN INTERFACE AND THEIR CARAYA TESTS BUILD END TO END WITHOUT NI's SERVICE since 2026-10-11** -
+`lvai_create_interface`, `_create_class`, `_add_class_method`, `_create_accessors`,
+`_generate_class_test`, `_generate_method_test`, the runner and the run, with `LABVIEW_GRPC_PORT`
+dead so any hidden NI call would have failed: 5 of 5 green, every VI executable, a negative control
+failing on demand, **120 s against 111 s for the same build over grpc**. A route tool given
+`backend` hands it to every inner call (`AixmlBackend.Inherited`). **And the test generators call
+the class DIRECTLY there too, with NOTHING OPENED** - the composer finds a class member by FILE and
+writes the dynamic-dispatch call (`dynIUse`, `VIPI`/`DyOM`) and the class constant (`FPPI`/`DDPI`)
+itself, which pylabview could only read after a patch for LabVIEW 2026's 8 extra link-cache bytes
+(`tools/pylabview/patches/patches.json`). Before that they took the socket route and the same build
+took 172 s. A class constant's flattened name is padded to 4 - `Rectangle.lvclass` hid it, the
+`Box` fixture showed it. Those harvested parts needed `LABVIEWMCP_AIXML_PARTS` until they shipped in
+`scripts\aixml-pylabview\parts` (below); the variable now only OVERRIDES the parts the server
+hands the composer (`--parts`), while the composer's own tables - hotpoints, event codes, names -
+always come from the `parts\` beside its code (`lvheap.own_parts`). Run answers over ActiveX carry LabVIEW's flattened XML now, so a parser
+written for the gRPC shape reads both. **EVERYTHING THE BACKEND NEEDS SHIPS SINCE 2026-10-12 -
+the user's decision that a ZIP user needs nothing from `experiments\`.** Code, name tables and all
+4 432 parts live in `scripts\aixml-pylabview` (1 253 until 2026-10-13, when the cache, the Project
+Providers, `wizard\ZE_Links` and NI donors were harvested in - FINDINGS §7b; a part cut from an
+IMPLICIT invoke node killed LabVIEW on load, so none is cut or composed any more), the helper parts NI's converter built from our own
+AIXML included (80 of 83 helper documents compose and all 80 load executable; the other three are
+LUnit templates the tool fills first). A part's provenance names `<labview>\…` or a bare file name,
+never a workstation path - `lvheap.portable_source`, also at every harvest, and a test fails on an
+absolute path. `experiments\` keeps the measurement scripts, the suite and FINDINGS, which import
+the code from its new place. **A LabVIEW OLDER THAN 2026 in use makes `pylabview` the default** (the
+user's rule of 2026-10-12, below an explicit call, flag or variable) - even 2025, which has NI's
+service - **and the composer WRITES THE FILE AS THAT RELEASE, set at compose time, the parts
+untouched.** Measured on the user's LabVIEW 2025 station the same day: every composed VI was
+`Error 1125, File version is later than the current LabVIEW version`, because each inherits the
+skeleton's 2026 stamps. `aixml2vi.py --lv-version N` (the server passes it for LabVIEW 2020 and
+later) rewrites `LVSR`, `vers` and the variants' version word in the composed bundle, and
+pylabview then writes that release's records - checked against a VI LabVIEW 2025 saved. Two
+defects only that stamp showed: the password salt named the skeleton's type 2 instead of the
+pane's (`VI password tampered`), and the 8 class-link bytes the pylabview patch wrote from 26 on
+exist since LabVIEW 2020 (`data structure corrupt`). LabVIEW 2026 loads the suite composed as
+2020-2025 files; a load in LabVIEW 2025 itself is the user's test. `docs/aixml-backends.md`.
 
 **THERE IS A FIFTH DOOR AND IT IS NAILED SHUT: `lvai_apply_aixml_to_vi` IS NOT CALLED. EVER —
 unless the user asks for it by name, in that session.** The user's standing instruction of
@@ -2158,6 +2296,19 @@ So: design the frame to read the payload, then make the toolchain reach it.
 into a **prim** input plus `lvai_set_event_data_fields` as a third build step — and a front-panel
 Local Variable is never the substitute, because it holds what the panel has at that instant rather
 than what the event carried. `scripts/aixml-skeletons/user-event-two-loops.md` is the worked example.
+**On the `pylabview` backend none of that detour is needed** (2026-10-10): our composer writes the
+user-event spec, the wire onto the dynamic event terminal and the payload field in one compose - the
+skeleton runs `Ticks Received = 5`, a variant only the payload can stop stopped on it, and a cluster
+payload is read element by element, and several user events may share one registration. **The gRPC
+route finishes several user-event frames too, since 2026-10-11** - it refused them until then:
+`dynIndex` is the event's position among the registration's items, the generation step writes it
+per frame, and `lvai_wire_dynamic_events` reads it off the VI BEFORE its wiring save destroys it.
+Measured with the frames in the opposite order to the registration: the run counted right, and a
+copy with the two frames swapped counted 0. A CONTROL REFERENCE as the source composes too, the event read off
+the frame that names it and the code off a surveyed (class, event) table - and **registering for a
+front-panel object's events needs the VI's panel OPEN**: closed, `Register For Events` answers
+`Error 1001` and the Event Structure waits for ever, LabVIEW's own save of such a VI included.
+`docs/aixml-backends.md`.
 
 **FOR A FRONT-PANEL EVENT THERE IS A CHEAPER ROUTE, AND IT DOES NOT GENERALISE TO A USER EVENT.**
 A control terminal placed inside its own event frame already carries the value the event just
@@ -2500,6 +2651,23 @@ seconds, same two `OMAutoClasses` entries, zero new archives. The archives are w
 *starts* and finds leftovers from an abnormal end, so a pile of them counts past crashes rather than
 causing the next one - eight in one day looked exactly like a cause and was not.
 
+**A PROPERTY NAME WITH ITS CATEGORY DROPPED KILLS LabVIEW IN `ConvertAIXMLToVI` - measured
+2026-10-10, 4 of 4.** `fields="read+Version Number"` on `{LV.Application}`, where the name is
+`Application\3AVersion Number`: no error comes back, LabVIEW is gone, and its log reads `Insanity
+detected in heap BDHP ... {id } (0x4)` then `DAbort ... Fatal insanities(0x00000004) exist in
+ReportInsanities` (`fpsane.cpp`). The one-word correction converted, `errorCode 0`, `execState 1`.
+**Only that class and that shape were measured** - not another class, not an invented name with
+no category match, not `ValidateAIXML` on the same document. So `lvai_check_aixml` answers
+`propertyNameUnknown` as an ERROR exactly for that shape (unknown in the catalogue AND in
+`docs/vi-server-aixml-names.tsv`, the names NI's exports and our helpers really use, while a known
+name of the class is `Category:` + it), and `fix` writes the full name when only one fits - the
+crashing name fits TWO, `Operating System:Version Number` being the other; any other unknown Property
+or Invoke name is a WARNING with the nearest known one, because both lists are incomplete.
+**`lvai_convert_aixml_to_vi` and `lvai_validate_aixml` refuse such a document BEFORE the RPC**
+(`propertyNameWouldCrashLabview`; `allowUnknownPropertyNames` overrides) - a check that only
+reports after the call is a post-mortem. `scripts/aixml_lint.py` reads the same four tables.
+`docs/aixml-reference.md`, "A wrong PROPERTY name can kill LabVIEW".
+
 **THE UID BASE IS 4200, AND TWO IMPLEMENTATIONS OF THAT RULE DISAGREED FOR DAYS.**
 `AixmlCheck.SafeUidBase` is 4200 and `scripts/aixml_lint.py`'s `LOW_UID_CEILING` was 5000, so the
 lint flagged `uid-low` on every file the generators themselves emit — and its own comment argued
@@ -2640,6 +2808,7 @@ literally it argued away 600 usable palette VIs.
 | How do I read or write AIXML? | `docs/aixml-reference.md` | `lvai_aixml_reference` |
 | What does `ValidateAIXML` NOT catch? | `docs/aixml-reference.md` | `lvai_check_aixml` |
 | How do I check AIXML with NO LabVIEW, before spending a round trip? | `docs/aixml-lint.md` | `scripts/aixml_lint.py` |
+| How do I convert, check or RUN a VI WITHOUT NI's gRPC service, or choose which route runs? | `docs/aixml-backends.md` | `backend` on the five AIXML tools, `lvai_exec_state` and `lvai_run_vi_and_read_values` (ActiveX for a running LabVIEW), and since 2026-10-13 on every tool that reaches LabVIEW but NI's own assistant features; `LABVIEWMCP_AIXML_BACKEND` / `--aixml-backend` for the server default; `pylv_status` shows it |
 | What is a DQMH module made of? | `docs/dqmh-patterns.md` | `lvai_dqmh_reference` |
 | How do I CREATE a DQMH module? | `docs/dqmh-scripting.md` §9f | `lvai_dqmh_new_module` - the type by NAME from the station's catalogue (every answer lists it), files into `<project>\Libraries\<Name>`, verified from the files |
 | How do I create a DQMH EVENT with no dialog, and what does it leave unfinished? | `docs/dqmh-scripting.md` §9c | `lvai_dqmh_new_event` - wires the tester's new inputs and saves what the scripting touched; a Broadcast with arguments leaves Main.vi broken until its `#CodeNeeded` call is placed |
