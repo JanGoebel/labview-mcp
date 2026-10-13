@@ -9,3 +9,9 @@
 # with core.autocrlf — the comparison passes either way, but a generated artefact should not
 # change size depending on who checked it out.
 *.tsv               text eol=lf
+
+# pylabview extracts are LF by nature, and the pane tests run pylv-conpane.py over them and compare
+# the result byte for byte with the fixture. Checked out as CRLF (core.autocrlf=true, which the
+# Windows runner has too) the script writes LF back and the round trip can never be identical -
+# green in a checkout that predates the fixture, red in a fresh clone and in the release workflow.
+tests/LabVIEWMCP.Tests/Fixtures/pane/thrall/*.xml  text eol=lf
