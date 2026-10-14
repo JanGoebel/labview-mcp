@@ -792,9 +792,16 @@ internal sealed class AixmlTools(LvaiConnection connection)
             // errorCode 0 for an eBad result. Measured 2026-10-01 on a Web Browser document: the
             // validator said `Invalid method`, this wrote the VI, and only lvai_exec_state saw it.
             int? execState = null;
+            JsonNode? errors = null;
+            string? errorsNotRead = null;
             if (checkExecutable && response.ErrorCode == 0 && File.Exists(viPath))
-                execState = (int?)JsonNode.Parse(await new ExecStateTools(connection).ExecStateAsync(
-                    Path.GetFullPath(viPath), timeoutSeconds: timeoutSeconds, ct: ct))?["execState"];
+            {
+                var exec = JsonNode.Parse(await new ExecStateTools(connection).ExecStateAsync(
+                    Path.GetFullPath(viPath), timeoutSeconds: timeoutSeconds, ct: ct));
+                execState = (int?)exec?["execState"];
+                errors = exec?["errors"]?.DeepClone();
+                errorsNotRead = exec?["errorsNotReadBecause"]?.GetValue<string>();
+            }
             var broken = execState == 0;
             return Json.Message(response,
                 [.. SymbolicFacts(symbolic),
@@ -807,11 +814,16 @@ internal sealed class AixmlTools(LvaiConnection connection)
                  ("ok", checkExecutable && response.ErrorCode == 0 && execState is >= 0
                      ? JsonValue.Create(!broken) : null),
                  ("warning", broken
-                     ? JsonValue.Create("The VI was WRITTEN but is BROKEN (execState 0). The converter "
-                         + "writes documents the validator refuses; run lvai_validate_aixml on the same "
-                         + "file for the reason - it names the node. For a class method or a call to a "
-                         + "loaded subVI a broken intermediate can be expected; anywhere else it is not.")
+                     ? JsonValue.Create("The VI was WRITTEN but is BROKEN (execState 0). " +
+                         (errors is not null
+                             ? "`errors` holds the lines LabVIEW's Error List shows for it, each with its explanation; "
+                             : "Its Error List lines were NOT read (`errorsNotReadBecause`) - ask lvai_exec_state; ")
+                         + "lvai_validate_aixml on the same file names the node as well. For a class "
+                         + "method or a call to a loaded subVI a broken intermediate can be expected; "
+                         + "anywhere else it is not.")
                      : null),
+                 ("errors", broken ? errors : null),
+                 ("errorsNotReadBecause", broken && errorsNotRead is not null ? JsonValue.Create(errorsNotRead) : null),
                  // THIS PATH MATTERS MOST for the check: it is the documented route for a class
                  // method - convert WITHOUT validating, because ValidateAIXML is stricter than the
                  // converter for a class wire - so nothing else looks at the file at all.
@@ -1014,6 +1026,22 @@ internal sealed class AixmlTools(LvaiConnection connection)
         }
 
         var broken = execState == 0;
+        // THE COMPOSER DOES NOT TYPE-CHECK WIRING, so a broken result is where the cause matters
+        // most: the composed exec-state helper reads the Error List's lines (Get Errors), only
+        // here, because the direct read above has no such property.
+        JsonNode? errors = null;
+        string? errorsNotRead = null;
+        if (broken)
+        {
+            try
+            {
+                var read = await ExecStateTools.ReadOverComAsync(viPath, timeoutSeconds, ct);
+                errors = ExecStateTools.ErrorsNode(read.Reading);
+                if (errors is null)
+                    errorsNotRead = read.WhyNoHelper ?? ExecStateTools.ErrorsNotReadBecause(read.Reading);
+            }
+            catch (LabViewCom.ComException e) { errorsNotRead = $"{e.Kind}: {e.Message}"; }
+        }
         var unopenable = openError is not null;
         var compiled = result.Written && File.Exists(viPath) && ContainsCompiledCode(viPath);
         return ComposerAnswer(result, choice,
@@ -1030,11 +1058,16 @@ internal sealed class AixmlTools(LvaiConnection connection)
                  : checkExecutable && result.Written && execState is >= 0
                      ? JsonValue.Create(!broken) : null),
              ("openError", unopenable ? JsonValue.Create(openError) : null),
+             ("errors", errors),
+             ("errorsNotReadBecause", errorsNotRead is null ? null : JsonValue.Create(errorsNotRead)),
              ("executableNote", execNote is null ? null : JsonValue.Create(execNote)),
              ("warning", broken
                  ? JsonValue.Create("The VI was WRITTEN but is BROKEN (execState 0). The composer " +
-                     "does not type-check wiring; compare with the grpc backend on the same " +
-                     "document, whose validation names the node.")
+                     "does not type-check wiring; `errors` holds the lines LabVIEW's Error List " +
+                     "shows for it, each with its explanation" + (errors is null
+                         ? " - not read this time, so compare with the grpc backend, whose " +
+                           "validation names the node."
+                         : "."))
                  : unopenable
                      ? JsonValue.Create("The VI was WRITTEN and LabVIEW could NOT OPEN it - " +
                          openError + ". A file LabVIEW refuses to load is broken, not unmeasured; " +
