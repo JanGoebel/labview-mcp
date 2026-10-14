@@ -953,6 +953,66 @@ visible in `user.lib\LV_MCP` sockets composed since 2026-10-10. It unescapes bot
 `tests/.../Infra/ReaderControlFileTests.cs` pins three real controls to NI's export of them, and
 fails on all three with the reader before the change.
 
+## NI's converter labels every Invoke Node `Instr` (measured 2026-10-14)
+
+Seen by the user on `lvai_vi_errors.vi` built through NI's service: the `Get Broken VI List` node,
+an `{LV.Application}` method, carried the header `Instr` where NI's own
+`AB_Get_Detailed_BrokenVI_Message.vi` shows `App`, and `Get Errors` showed `Instr` where NI's shows
+`VI`. **The AIXML was right** (`type="{LV.Application}"`, `type="{LV.VI}"`) and so was the VI: an
+export of the NI-built VI reads both classes back correctly, and both methods returned the right
+answers in every acceptance run. The header is a STRING in the diagram heap - the invoke node's
+`nodeName` - and NI's converter writes `"Instr"` into it whatever the class is:
+
+| built by | `Get Broken VI List` | `Get Errors` | `methCode` / `invokeFlags` |
+|---|---|---|---|
+| NI's own VI (`AB_Get_Detailed_BrokenVI_Message.vi`) | `nodeName "App"` | `nodeName "VI"` | 2429 / 201408, 1106 / 200408 |
+| our composer (`pylabview`) | `"App"` | `"VI"` | identical |
+| NI's converter (`grpc`) | **`"Instr"`** | **`"Instr"`** | identical |
+
+The same label is on `BD.CleanUp` and `Save.Instrument` in `lvai_cleanup_diagram.vi`, both ordinary
+public `{LV.VI}` methods, so it is not about the methods being unlisted. Only `oMId` differs besides
+the label, and that is the node's index into the VI's own object table. Property nodes built by NI's
+converter keep their real class (`App`, `Project`). So: **cosmetic, and NI's** - a reader of a
+grpc-built diagram sees `Instr` on every Invoke Node and has to take the class from the reference
+wire or an export. Not patched: the label is the converter's output, and editing heap strings after
+every conversion would be a pylabview step on every grpc build for a display defect. The composer,
+which the error-list helper prefers, writes the right label.
+
+## A Bundle/Unbundle By Name drew only its first field (fixed 2026-10-14)
+
+Seen by the user on the composed `lvai_vi_errors.vi`: an `Unbundle By Name` over `code,source`
+showed `code` and a clipped, empty second row. The composer clones its terminals from a harvested
+ONE-field part and placed every field on that part's first row at that part's width (29 px), so
+the second field sat under the first. NI's converter drew the same node correctly. Measured over
+68 `nMux` nodes in NI's own VIs (`(Un)Bundle By Name` in the cached exports, heaps read with
+pylabview): **width = text width of the longest field name + 24, height = 16 per field + 1, field
+k on row 16k**; an Unbundle has its cluster terminal at `(0, 0, H, 16)` and its fields at
+`(16k, 16, 16k+16, W)`, a Bundle its output at `(0, W-8, H, W)` and its fields at
+`(16k, 0, 16k+16, W-16)`. The only exceptions were nested fields (`Settings.Graph?`), drawn by their
+last part, which the composer refuses anyway. `Composer._nmux_geometry` applies it; re-measured on
+the composed `lvai_vi_errors.vi` (both nodes show `code`/`source`) and on a probe bundling and
+unbundling three fields, which ran `[true,42,probe]`.
+
+## A For Loop's subdiagram label floated, and its N sat on it (fixed 2026-10-14)
+
+Seen by the user on the same composed VI: the loop's `N` was drawn ON the subdiagram label bar,
+where LabVIEW's own loop has it below. The composer placed the label but left `N` (the `lMax` DCO)
+at the shell's `(0, 0, 16, 16)`. Measured over 25 labelled For Loops in NI's own VIs: in 22,
+**N's top is the label's bottom - 1** (label `1..18` -> N `17..33`, label `1..42` -> N `41..57`),
+whatever the label's height; every unlabelled loop has N at `(0, 0, 16, 16)`. The three outliers
+are two loops with N at the top despite a label and one at `(55, 0)` under a 56-px label - not a
+rule. The composer now applies it; checked on the composed `lvai_vi_errors.vi` and on `t159` (a
+two-line label with N WIRED: the wire is routed to the new position, `execState 1`).
+
+**And the label itself floated 5 px inside the frame**, which the user saw next: LabVIEW puts a
+subdiagram label exactly on its structure's `contRect`, for every class measured, and the composer
+wrote a For Loop's `contRect` six pixels in all round like a While Loop's. NI's is
+`(+1, +1, -5, -5)` relative to the bounds - a one-pixel border top and left, the page stack
+bottom-right - on all 8 labelled For Loops and on unlabelled ones alike; While Loops (63), Case
+structures (36) and Flat Sequence frames (3) match what the composer writes. A Disable structure
+(`commentNode`) reads `(+1, +1, -1, -1)` on NI's four, but written so in the composer its label
+slid under the frame selector, so that one stays at 6 until the selector's geometry is measured.
+
 ## Not covered, and not measured
 
 - **ActiveX is Windows only and needs a running LabVIEW**; it never starts one, so with no LabVIEW
