@@ -92,20 +92,24 @@ internal sealed class InspectTools(LvaiConnection connection)
         The last line of the answer says whether the export came from the disk cache or from
         LabVIEW, the same way lvai_convert_vi_to_aixml reports it; pass refresh to force a
         re-export when you suspect a stale entry.
-        IT CANNOT SEE INSIDE AN `.llb`, AND THAT RULES OUT MOST DRIVER APIs. A path through an
-        `.llb` answers `FileNotFoundException` - measured 2026-09-03 on
-        `...\create\channels.llb\DAQmx Create Virtual Channel.vi` and the `timing.llb`
-        equivalent. EVERY DAQmx VI lives in an `.llb`, so this tool cannot give you their terminal
-        names at all, and hunting for a spelling it will never produce cost 240 s of wall clock
-        against 10 s inside LabVIEW - the worst row of that run.
-        WHAT WORKS INSTEAD: export an NI EXAMPLE that already calls the VI and copy its `Call`
-        element. `lvai_example_index` finds one, `lvai_convert_vi_to_aixml` reads it, and a single
-        example - `Voltage - Finite Input.vi` - yielded every terminal name AND both polymorphic
-        instance names at once. That is the documented route for any library-owned VI, not a
-        workaround.
+        A VI INSIDE AN `.llb` CONTAINER FILE IS READ TOO, since 2026-10-15 - spell the path through
+        the `.llb` as LabVIEW does: `...\DAQmx\configure\task.llb\DAQmx Clear Task.vi`. Every DAQmx
+        VI lives in such a file, and until then this tool answered `FileNotFoundException` for all
+        of them, on both backends, because the server checked the path exists before asking
+        anyone. NI's converter takes the path as it is (measured, `errorCode 0`), and the export is
+        cached like any installation VI, keyed on the `.llb`'s own stat; the pylabview reader
+        extracts the container once into `%USERPROFILE%\.labviewmcp\cache\llb` and reads the
+        member there. A member name the `.llb` does not hold is the reader's or NI's refusal.
+        The other route still works and is worth knowing for a whole API: export an NI EXAMPLE
+        that already calls the VI - `lvai_example_index` finds one - and a single example
+        (`Voltage - Finite Input.vi`) yields every terminal name and both polymorphic instance
+        names at once.
         ON THE pylabview BACKEND the export is our own reader's (vi2aixml.py) - no LabVIEW and no
-        NI service at all - and it is never cached and never served from the cache, which holds
-        NI's converter output only. The answer's last line names `backend` and `backendSource`.
+        NI service at all - and it goes through the export cache too since 2026-10-15, kept apart
+        from NI's entries by its key: a cached NI export of the VI is served first (higher fidelity,
+        reading it needs no NI service), then the reader's own earlier export, else a fresh read is
+        cached. A reader entry is never served to a grpc call. The provenance line says whose export
+        it was; the answer's last line names `backend` and `backendSource`.
         """)]
     public async Task<string> ViTerminalsAsync(
         [Description(@"Absolute path to the .vi whose terminals you need")] string viPath,
@@ -129,7 +133,9 @@ internal sealed class InspectTools(LvaiConnection connection)
                                                      AixmlBackend.Choice choice, CancellationToken ct) =>
         await Rpc.GuardAsync(async () =>
         {
-            if (!File.Exists(viPath))
+            // A path THROUGH an .llb container file is a VI too - both backends read its member
+            // (LlbPath), so only a path that is neither is refused here.
+            if (!LlbPath.Exists(viPath))
                 throw new FileNotFoundException($"No VI at '{viPath}'.", viPath);
 
             // Under the cache root, not %TEMP%: this file exists only to be parsed, and keeping
@@ -139,10 +145,8 @@ internal sealed class InspectTools(LvaiConnection connection)
                 $"terminals-{Path.GetFileNameWithoutExtension(viPath)}.xml");
             Directory.CreateDirectory(CacheDirectory.Scratch);
 
-            // THE READER NEITHER READS NOR WRITES THE EXPORT CACHE. It holds NI's converter output,
-            // and lvai_convert_vi_to_aixml on pylabview keeps the same rule: a reader export stored
-            // there would later be served as NI's, and an NI export served here would be an answer
-            // the backend asked for did not give.
+            // The reader goes through the cache too since 2026-10-15, under its own key
+            // (CachedReader): NI's cached export first, then its own, then a fresh read.
             var composed = choice.Name == AixmlBackend.PyLabview;
 
             // Through the export cache, both ways. This tool used to call the RPC directly and so
@@ -166,18 +170,18 @@ internal sealed class InspectTools(LvaiConnection connection)
                 if (AixmlComposer.Locate(out var missing) is not { } setup)
                     return Json.Error("backendNotAvailable", missing, new { viPath });
 
-                var read = await AixmlComposer.ReadAsync(setup, viPath, scratch, timeoutSeconds, ct);
+                var cached = await CachedReader.ReadAsync(setup, viPath, scratch, timeoutSeconds, ct,
+                                                          refresh);
+                var read = cached.Result;
                 if (!read.Written)
                     return Json.Error("exportFailed",
                         $"vi2aixml.py could not read '{viPath}': {read.Message}",
                         new { viPath, readerExitCode = read.ExitCode });
 
-                provenance = "Read by vi2aixml.py, the pylabview backend's reader - NOT by NI's " +
-                             "converter, and no LabVIEW was asked. Never cached: the export cache " +
-                             "holds NI's output only" +
-                             (refresh ? ", so refresh changes nothing here." : ".") +
-                             " A terminal name that differs from NI's export is the reader's until " +
-                             "shown otherwise.";
+                // whose export it is, then where it came from - each said once
+                provenance = cached.ServedFrom == AixmlBackend.Grpc
+                    ? cached.Note
+                    : CachedReader.ReaderProvenance + " " + cached.Note;
             }
             else if (fromCache)
             {

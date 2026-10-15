@@ -64,12 +64,49 @@ def own_parts():
 
 TYPEID_RE = re.compile(r"TypeID\((\d+)\)")
 
+# The five bytes Windows-1252 leaves undefined; Windows maps each to the C1 control of the same
+# number, and so does NI's AIXML export.
+_CP1252_HOLES = {0x81, 0x8D, 0x8F, 0x90, 0x9D}
+
+
+def value_text(b):
+    """A string VALUE's bytes - a constant, a default, a case item - as NI's export writes them:
+    Windows-1252, the five undefined bytes as U+0081 ... U+009D. Measured 2026-10-15 over the cached
+    NI exports: 0xD1 is `Ñ` and 0xFF `ÿ` there (MacRoman, which this code used until then, gives
+    `—` and `ˇ`), cp1252's own characters (`€`, `—`, ...) occur, and so do U+0081/8D/8F/90/9D.
+    It is the station's code page as LabVIEW stores strings; this station's is 1252."""
+    try:
+        return b.decode("cp1252")
+    except UnicodeDecodeError:
+        return "".join(chr(x) if x in _CP1252_HOLES else bytes([x]).decode("cp1252") for x in b)
+
+
+def value_bytes(s):
+    """The inverse of value_text, for the composer."""
+    try:
+        return s.encode("cp1252")
+    except UnicodeEncodeError:
+        return b"".join(bytes([ord(c)]) if ord(c) in _CP1252_HOLES else c.encode("cp1252") for c in s)
+
+
+def _pylabview_argv():
+    """How to start pylabview. The bundle's own python.exe on readRSRC.py, exactly what
+    pylabview.cmd runs - NOT through `cmd /c`: cmd.exe re-parses the command line, so a path
+    holding `&` (`Controls\\Path&Icon.ctl` in the LabVIEW Icon Editor, 2026-10-15) was split
+    there into two commands. Only a layout without that pair falls back to the launcher."""
+    here = os.path.dirname(PYLABVIEW_CMD)
+    python = os.path.join(here, "python.exe")
+    script = os.path.join(here, "app", "pylabview", "readRSRC.py")
+    if os.path.exists(python) and os.path.exists(script):
+        return [python, script]
+    return ["cmd", "/c", PYLABVIEW_CMD]
+
 
 def run_pylabview(args, timeout=120):
     # subprocess.run's own timeout kills only cmd.exe: the python grandchild keeps the pipes open
     # and the second communicate() then waits for ever - a coverage run hung 7 minutes on one
     # vi.lib VI that way (2026-10-10). Kill the whole tree instead.
-    p = subprocess.Popen(["cmd", "/c", PYLABVIEW_CMD] + args, stdin=subprocess.DEVNULL,
+    p = subprocess.Popen(_pylabview_argv() + args, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         out, err = p.communicate(timeout=timeout)

@@ -50,6 +50,9 @@ INDEX_SHIFT = 3   # consolidated 1 and 2 are the two connector-pane Function typ
 
 # a label objFlags bit only one donor carries - Composer.instantiate clears it
 LABEL_FLAG_DONOR_ONLY = 0x20000000
+# a While Loop's lTst DCO: set for Stop if True (objFlags 65537, the harvested shell), clear for
+# Continue if True (objFlags 1) - which NI's exporter writes as a <Condition> with NO value
+LOOP_STOP_IF_TRUE = 0x10000
 
 SCALARS = {
     "double": ("NumFloat64", "stdNum"), "single": ("NumFloat32", "stdNum"),
@@ -108,9 +111,11 @@ def _extract_callee(path):
     got = _CALLEES.get(key)
     if got is None:
         try:
+            # a member of an .llb CONTAINER has a virtual path through it; read its extracted file
+            real = resolve.materialize(path) or path
             d = tempfile.mkdtemp(prefix="callee_")
             _CALLEE_DIRS.append(d)
-            got = lvheap.extract(path, d, timeout=30)
+            got = lvheap.extract(real, d, timeout=30)
         except RuntimeError as ex:
             got = ex
         _CALLEES[key] = got
@@ -925,7 +930,7 @@ def _const_value(tree, value):
     if t in ("String", "Tag"):
         # a Tag constant (a DAQmx terminal name ...) is flattened like a string: measured
         # 0000000C 4F6E626F617264436C6F636B for "OnboardClock"
-        b = unescape(value or "").encode("mac_roman")
+        b = lvheap.value_bytes(unescape(value or ""))
         return (struct.pack(">I", len(b)) + b).hex().upper()
     if t == "NumFloatExt":
         return _quad(float(value or 0))
@@ -950,7 +955,7 @@ def _const_value(tree, value):
                 comps[0] = comps[0].rstrip(":")
             body = struct.pack(">HH", 0 if absolute else 1, len(comps))
             for c in comps:
-                cb = c.encode("mac_roman")
+                cb = lvheap.value_bytes(c)
                 body += struct.pack(">B", len(cb)) + cb
         return (b"PTH0" + struct.pack(">I", len(body)) + body).hex().upper()
     if t == "Refnum":
@@ -3840,6 +3845,12 @@ class Composer:
         keep = {lcnt.find("termList")[0].get("uid")}
         if ltst is not None:
             keep.add(ltst.find("termList")[0].get("uid"))
+            cond = next((c for c in el if c.tag == "Condition"), None)
+            if cond is not None and cond.get("value") != "stop":
+                # Continue if True: NI writes the Condition with no value (vi2aixml reads it so
+                # since 2026-10-15); composed as Stop if True, such a loop ran inverted
+                flags = ltst.find("objFlags")
+                flags.text = str(int(flags.text or 0) & ~LOOP_STOP_IF_TRUE)
         lmax_outer = lmax_inner = None
         if loop.find("loopLimitDCO") is not None:
             lmax_uid = loop.find("loopLimitDCO").get("uid")
@@ -3907,7 +3918,7 @@ class Composer:
         owner = None
         for _ in range(4):
             cand = os.path.join(d, libs[-1])
-            if os.path.exists(cand):
+            if resolve.exists(cand):
                 owner = cand
                 break
             d = os.path.dirname(d)
@@ -4559,7 +4570,7 @@ class Composer:
                     if st.get("Type") != "String":
                         raise Unsupported("Case Structure %s: string selectors on a %s wire" % (el.get("uid"), st.get("Type")))
                     strs = sorted({x[1:-1] for its in items for x in its if x.startswith('"') and ".." not in x},
-                                  key=lambda s: s.encode("mac_roman"))
+                                  key=lvheap.value_bytes)
                     strings = strs
                     value = lambda x: strs.index(x[1:-1])
                 elif kind == "enum":
@@ -4603,7 +4614,7 @@ class Composer:
             for c in list(sa):
                 sa.remove(c)
             for s in strings:
-                ET.SubElement(sa, "SL__arrayElement").text = s.encode("mac_roman").hex().upper() or None
+                ET.SubElement(sa, "SL__arrayElement").text = lvheap.value_bytes(s).hex().upper() or None
             sa.set("elements", str(len(sa)))
             case.find("SelectDefaultCase").text = "%02X" % default
             case.find("SelectNRightType").text = str(len(ra))

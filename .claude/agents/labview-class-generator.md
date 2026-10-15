@@ -746,8 +746,10 @@ Everything here was verified before this agent was written. Treat it as fact.
 
 - **Look terminal names up with `lvai_aixml_reference` and `lvai_example_index`, in ONE batched
   call.** Both are in your tool list. `lvai_aixml_reference` takes `node=` as a comma-separated
-  list; `lvai_vi_terminals` cannot see inside an `.llb`, which rules out most driver APIs, and the
-  route there is an NI example that already calls the VI. Measured 2026-09-04: a run that did not
+  list; `lvai_vi_terminals` reads a VI inside an `.llb` FILE too since 2026-10-15 - spell the
+  path through the `.llb` (`...\configure\task.llb\DAQmx Clear Task.vi`), on either backend - and
+  for a whole driver API an NI example that already calls it is still one read for all its
+  terminal names. Measured 2026-09-04: a run that did not
   have these tools spent **4.5 minutes of wall clock against 3 seconds inside LabVIEW** exporting
   three examples to find the TDMS terminal names, and re-derived a `Bundle By Name` rule that has
   been in `docs/aixml-reference.md` since 2026-08-09.

@@ -704,6 +704,12 @@ and copy its `Call` element.** `Voltage - Finite Input.vi` yielded every termina
 polymorphic instance names at once. `lvai_vi_terminals` now says this in its own description, which
 is where it is read at the moment it is needed.
 
+**CORRECTED 2026-10-15: the tool reads inside an `.llb` FILE now, on both backends.** The
+`FileNotFoundException` was the SERVER's own `File.Exists` check, not a limit of either converter:
+NI's `ConvertVIToAIXML` takes `...\configure\task.llb\DAQmx Clear Task.vi` as it is (`errorCode 0`,
+the full export), and the pylabview reader extracts the container through `resolve.py` and reads
+the member. `docs/aixml-backends.md`, "Reading a VI inside an `.llb` FILE".
+
 ### Result
 
 22 tests green across both classes — 4 + 2 on the parent, 4 + 4 + 8 on the child — 12 members all
@@ -1556,7 +1562,9 @@ Three things about it are not optional:
   not.
 
 The VI lives in an `.llb` (`vi.lib\Utility\traverseref.llb`), so `lvai_vi_terminals` cannot read it
-and a bare name does not resolve. The qualifier and every terminal name above came from exporting
+and a bare name does not resolve. (Corrected 2026-10-15: the bare name fails because the VI is a
+LIBRARY member - `traverseref.llb` is a folder, and the `.llb` itself does not stop a `Call`;
+`docs/aixml-reference.md` §9, "`.llb` targets on the two backends".) The qualifier and every terminal name above came from exporting
 NI's own `Obtaining Unknown Object References.vi`, which is the documented route for any
 library-owned VI.
 

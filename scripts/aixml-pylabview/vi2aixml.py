@@ -14,6 +14,7 @@ between them. What it does not read yet is written as an XML comment naming the 
 so nothing is dropped in silence.
 """
 import json
+import math
 import os
 import re
 import shutil
@@ -30,6 +31,7 @@ TYPE_TO_AIXML = {v[0]: k for k, v in aixml2vi.SCALARS.items()}
 TYPE_TO_AIXML["MeasureData.TimeStamp"] = "timestamp"
 INT_FMT = aixml2vi.INT_FMT
 SINK = 0x8000          # objFlags bit on a terminal that RECEIVES a wire (measured, see FINDINGS)
+LOOP_STOP_IF_TRUE = aixml2vi.LOOP_STOP_IF_TRUE
 
 
 def escape(s):
@@ -124,13 +126,37 @@ def aixml_type(tree):
         return "fixed"      # NI's export writes a fixed-point number bare, its word lengths dropped
     if k and k.startswith("Unit"):
         base = TYPE_TO_AIXML.get("Num" + k[4:])
-        if base is None or tree.find("PhysUnit") is not None:
+        if base is None:
             return None
+        units = tree.findall("PhysUnit")
+        if units:
+            spelt = unit_text(units)
+            return "%s{%s}" % (base, spelt) if spelt else None
         labels = [e.text or "" for e in tree.findall("EnumLabel")]
         if labels:
             return "%s{%s}" % (base, ",".join(escape_value(l) for l in labels))
         return base
     return TYPE_TO_AIXML.get(k)
+
+
+# a numeric's PHYSICAL UNIT: one <PhysUnit Val1=base Val2=exponent> per SI base unit, the exponent
+# a signed 16-bit number (65533 is -3). NI's export spells the product `m^-3 kg` - in base order,
+# separated by a space, exponent 1 bare. Measured 2026-10-15 on the cache's units: 2 = s, 3 = m,
+# 4 = kg (double{s}, double{m}, double{m^-3 kg}); the rest is LabVIEW's base-unit order and is
+# NOT measured here, so an index outside the three reads as "unknown unit" rather than a guess.
+PHYS_UNITS = {2: "s", 3: "m", 4: "kg"}
+
+
+def unit_text(units):
+    parts = []
+    for u in sorted(units, key=lambda u: int(u.get("Val1") or 0)):
+        name = PHYS_UNITS.get(int(u.get("Val1") or -1))
+        if name is None:
+            return None
+        exp = int(u.get("Val2") or 1)
+        exp = exp - 0x10000 if exp >= 0x8000 else exp
+        parts.append(name if exp == 1 else "%s^%d" % (name, exp))
+    return " ".join(parts)
 
 
 def empty_value(tree):
@@ -190,10 +216,12 @@ def escape_value(v):
 
 
 def fmt_float(v):
+    # lower case, as NI's exporter writes them: 8 nan and 18 inf/-inf in the cached exports and
+    # not one NaN or Inf (2026-10-15)
     if v != v:
-        return "NaN"
+        return "-nan" if math.copysign(1.0, v) < 0 else "nan"   # NI keeps the sign bit
     if v in (float("inf"), float("-inf")):
-        return "Inf" if v > 0 else "-Inf"
+        return "inf" if v > 0 else "-inf"
     return "%.17g" % v
 
 
@@ -275,17 +303,37 @@ def _flat_decode(tree, b, pos):
         return str(struct.unpack(INT_FMT[t], b[pos:pos + n])[0]), pos + n
     if t == "String":
         n = struct.unpack(">I", b[pos:pos + 4])[0]
-        return escape_value(b[pos + 4:pos + 4 + n].decode("mac_roman")), pos + 4 + n
+        return escape_value(lvheap.value_text(b[pos + 4:pos + 4 + n])), pos + 4 + n
     if t == "Path":
         n = struct.unpack(">I", b[pos + 4:pos + 8])[0]
         return _decode_value(tree, b[pos:pos + 8 + n].hex()), pos + 8 + n
+    # Measured 2026-10-15 on the cluster constants the reader left undecoded (63 in the cache): a
+    # REFNUM in a constant is four bytes and NI writes it empty; a PICTURE is length-prefixed like
+    # a string; an EMPTY variant is the 20 bytes below and NI writes it empty too. A variant that
+    # holds data is not decoded - its layout was not measured.
+    if t == "Refnum":
+        if len(b) < pos + 4:
+            raise ValueError("refnum past the end")
+        return "", pos + 4
+    if t == "Picture":
+        n = struct.unpack(">I", b[pos:pos + 4])[0]
+        return escape_value(lvheap.value_text(b[pos + 4:pos + 4 + n])), pos + 4 + n
+    if t == "LVVariant":
+        if b[pos + 4:pos + 20] == EMPTY_VARIANT_TAIL:
+            return "", pos + 20
+        raise ValueError("a variant holding data")
     raise ValueError("no flattened form known for %s" % t)
+
+
+# an EMPTY variant flattened, after its 4-byte version word (0x26008000 in LabVIEW 2026): one type,
+# void (`0004 0000`), then `0001 0000`, no data and no attributes
+EMPTY_VARIANT_TAIL = bytes.fromhex("00000001000400000001000000000000")
 
 
 def _decode_value(tree, hexstr):
     if tree.get("Type") == "TypeDef" and tree.find("TypeDesc") is not None:
         return _decode_value(tree.find("TypeDesc"), hexstr)
-    if tree.get("Type") in ("Array", "Cluster", "NumFloatExt", "NumComplex128", "NumComplex64"):
+    if tree.get("Type") in ("Array", "Cluster", "NumFloatExt", "NumComplex128", "NumComplex64", "Picture"):
         return _flat_decode(tree, bytes.fromhex(hexstr) if hexstr else b"", 0)[0]
     t = tree.get("Type")
     if t and t.startswith("Unit"):
@@ -305,7 +353,7 @@ def _decode_value(tree, hexstr):
         return "true" if b and b[0] else "false"
     if t in ("String", "Tag"):
         n = struct.unpack(">I", b[:4])[0] if b else 0
-        return escape_value(b[4:4 + n].decode("mac_roman"))
+        return escape_value(lvheap.value_text(b[4:4 + n]))
     if t == "Path":
         if len(b) < 12:
             return ""
@@ -313,7 +361,7 @@ def _decode_value(tree, hexstr):
         comps, i = [], 12
         for _ in range(count):
             n = b[i]
-            comps.append(b[i + 1:i + 1 + n].decode("mac_roman"))
+            comps.append(lvheap.value_text(b[i + 1:i + 1 + n]))
             i += 1 + n
         if kind == 0 and comps:
             return escape_value(comps[0] + ":\\" + "\\".join(comps[1:]))
@@ -465,10 +513,12 @@ def link_file(path, caller_file):
         if _RESOLVER is None:
             import resolve
             _RESOLVER = resolve.Resolver()
+        import resolve
         for anchor, d in _RESOLVER.roots:
             if anchor == comps[0]:
-                p = os.path.join(d, *comps[1:])
-                if os.path.exists(p):
+                # a path through an .llb CONTAINER (every DAQmx link) is read from its extracted member
+                p = resolve.materialize(os.path.join(d, *comps[1:]))
+                if p:
                     return p
         return None
     if kind == 0:
@@ -479,7 +529,12 @@ def link_file(path, caller_file):
     p = caller_file
     for c in comps:
         p = os.path.dirname(p) if c == "" else os.path.join(p, c)
-    return p if os.path.isfile(p) else None
+    if os.path.isfile(p):
+        return p
+    # a sibling inside the same .llb container file as a caller read from one
+    import resolve
+    m = resolve.materialize(p)
+    return m if m and os.path.isfile(m) else None
 
 
 def callee_slots(path):
@@ -555,8 +610,22 @@ def set_sublabel(el, diag):
 def name_attr(s):
     """A label as a `_name` attribute, as NI's exporter writes one: a backslash DOUBLED - it writes
     `delimiter (\\\\t)` for the label `delimiter (\\t)` - so the composer's unescape cannot read a
-    backslash and two hex digits that follow it as one character."""
-    return s.replace("\\", "\\\\")
+    backslash and two hex digits that follow it as one character. And ':' and ',' as \\3A and \\2C:
+    counted 2026-10-15 over 869 cached NI exports, 85 of 85 control and indicator names holding a
+    colon carry \\3A and 23 of 23 holding a comma carry \\2C. Raw, JKI's `attribute? (F: entity)`
+    reached lvai_vi_terminals as a name no `inputs=` string can carry, ':' being its separator."""
+    return s.replace("\\", "\\\\").replace(":", "\\3A").replace(",", "\\2C")
+
+
+_LABEL_ESCAPES = {"\\\\": "\\", "\\3A": ":", "\\2C": ","}
+
+
+def label_of(name):
+    """The label behind a `_name` written by name_attr - for the places that hand a control's name
+    on as something else: a terminal name (escaped again by `escape`), a `link=` (NI writes it RAW,
+    `link="PV:"`) or an event selector (escaped by its own rule). Measured as a regression the day
+    name_attr learned \\3A: a VI Server Reference's output came out `SP\\5C3A`."""
+    return re.sub(r"\\\\|\\3A|\\2C", lambda m: _LABEL_ESCAPES[m.group(0)], name)
 
 
 def unquote(t):
@@ -569,6 +638,37 @@ def unquote(t):
 def esc_attr_items(items):
     """Case selector items as NI writes them: joined by ', ' with the comma escaped."""
     return "\\2C ".join(items)
+
+
+def esc_case_text(s):
+    """A string or enum case item's TEXT as NI writes it inside the quotes: ',' as \\2C - NI's own
+    `"N-waveforms\\2C N-filters"`, which unescaped raw would split into two items - control
+    characters as \\XX, and a backslash DOUBLED so aixml2vi.unescape cannot read what follows it as
+    hex. A raw control character is not legal XML 1.0 at all: the LabVIEW Icon Editor's KeyDown.vi
+    has a Backspace case `"\\x08"`, and the export was unreadable from that byte on (2026-10-15)."""
+    return "".join("\\\\" if c == "\\" else ("\\%02X" % ord(c) if ord(c) < 0x20 or c == "," else c) for c in s)
+
+
+# what XML 1.0 forbids outright; \t \n \r are legal and ElementTree writes them as references
+_XML_ILLEGAL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def escape_illegal_xml_chars(root):
+    """The last line of defence before serialising: an attribute or text holding a character XML
+    1.0 forbids makes the WHOLE export unparseable, so it is written as \\XX - AIXML's own escape -
+    and a comment names each place, because a path that reaches here was not escaped on purpose."""
+    hits = []
+    for el in root.iter():
+        for k, v in list(el.attrib.items()):
+            if _XML_ILLEGAL.search(v):
+                el.set(k, _XML_ILLEGAL.sub(lambda m: "\\%02X" % ord(m.group()), v))
+                hits.append("%s %s=" % (el.tag, k) + (" uid %s" % el.get("uid") if el.get("uid") else ""))
+        if el.text and _XML_ILLEGAL.search(el.text):
+            el.text = _XML_ILLEGAL.sub(lambda m: "\\%02X" % ord(m.group()), el.text)
+            hits.append("%s text" % el.tag)
+    for h in hits:
+        root.append(ET.Comment(" vi2aixml: control character written as \\XX in %s " % h))
+    return hits
 
 
 # heap class of a fixed-shape node -> its AIXML name; the terminal names come from the
@@ -881,6 +981,21 @@ class Reader:
                 ranks[t[2]] = n
         return ranks
 
+    def dco_def(self, d):
+        """A DCO as its DEFINITION. A term's <dco> is often a bare `<dco uid="402"/>` whose class
+        and body live elsewhere in the heap - a shift register's rSR, for one, is defined NESTED in
+        its lSR (`<dco class="lSR"> ... <rsrDCO class="rSR" uid="402">`), so the loop's own term for
+        it carries no class. Read as classless, 53 of 58 missing shift registers in the cached NI
+        exports went missing that way (2026-10-15)."""
+        if d is None or d.get("class"):
+            return d
+        if getattr(self, "_dco_index", None) is None:
+            self._dco_index = {}
+            for e in self.b.bd.iter():
+                if e.get("class") and e.get("uid"):
+                    self._dco_index.setdefault(e.get("uid"), e)
+        return self._dco_index.get(d.get("uid"), d)
+
     @staticmethod
     def node_defs(diag):
         """The nodes of a diagram, in nodeList order, each resolved to its DEFINITION (often in
@@ -1003,8 +1118,18 @@ class Reader:
             if el.tag in ("Node", "Call") and not nm.startswith("#"):
                 per_el.setdefault(id(el), (el, []))[1].append((tu, nm, sink))
         for el, terms in per_el.values():
-            ins = ["%s:%s" % (escape(nm), self.term_net[tu]) for tu, nm, sink in terms if sink and tu in self.term_net]
-            outs = ["%s:%s" % (escape(nm), self.term_net[tu]) for tu, nm, sink in terms if not sink and tu in self.term_net]
+            # A CALL lists every terminal of its callee's pane, an unwired one with an empty net, as
+            # NI's exporter writes it (5 686 of 15 655 call inputs and 4 278 of 10 402 outputs in
+            # the cached exports are `name:`). Wired-only left a polymorphic VI's instances - whose
+            # calls are never wired - with no terminals at all, and lvai_vi_terminals on the
+            # pylabview backend then had nothing to name (Trim Whitespace.vi, 2026-10-15). A name
+            # the reader could not establish (`?`) stays out rather than going in as a terminal.
+            # Primitives keep wired-only: their unwired names come from a table with gaps.
+            every = el.tag == "Call"
+            ins = ["%s:%s" % (escape(nm), self.term_net.get(tu, "")) for tu, nm, sink in terms
+                   if sink and (tu in self.term_net or (every and not nm.startswith("?")))]
+            outs = ["%s:%s" % (escape(nm), self.term_net.get(tu, "")) for tu, nm, sink in terms
+                    if not sink and (tu in self.term_net or (every and not nm.startswith("?")))]
             for attr, items in (("inputs", ins), ("outputs", outs)):
                 if items:
                     el.set(attr, ",".join(items))
@@ -1117,6 +1242,17 @@ class Reader:
         el.set("type", t or "?" + lvheap.type_key(tree))
         el.set("uid", ddo.get("uid"))
         el.set("uid_parent", parent_uid)
+        if dco.find("ConstValue") is None:
+            # NOT a default: measured 2026-10-15 over the cache, every constant of a file saved by
+            # LabVIEW 11 or later carries ConstValue (5 803 of 5 803), and only the LabVIEW 9.0
+            # files lack it - their values live in the compiled data space, which pylabview does
+            # not decode, and 64 of their 78 are not the default. Decoding "" as 0/false/"" made
+            # Dictionary Example.vi's 57 constants plausible and wrong.
+            el.set("value", "")
+            self.notes.append("constant %s: value not stored in the block diagram heap (a file from "
+                              "before LabVIEW 11 keeps it in compiled code) - not decoded" % ddo.get("uid"))
+            self.term_owner[term.get("uid")] = (el, "value", False)
+            return el
         v = decode_value(tree, dco.findtext("ConstValue") or "") if t else None
         el.set("value", v if v is not None else "")
         if v is None:
@@ -1218,7 +1354,14 @@ class Reader:
                 self.term_owner[t.get("uid")] = (el, "#count", False)
         tst = node.find("loopTestDCO")
         if tst is not None:
-            cond = ET.Element("Condition", {"uid": tst.get("uid"), "uid_parent": node.get("uid"), "value": "stop"})
+            # value="stop" only for Stop if True: the lTst DCO carries 0x10000 then (objFlags 65537),
+            # and Continue if True clears it (objFlags 1) - where NI's exporter writes NO value at
+            # all. Measured 2026-10-15 on SB_WriteINIVal.vi, picktime.vi and Add Abstract Message
+            # to Actor.vi, all three objFlags 1 and value-less in NI's export, against 428 NI
+            # "stop" conditions; this wrote "stop" for every loop until then.
+            cond = ET.Element("Condition", {"uid": tst.get("uid"), "uid_parent": node.get("uid")})
+            if int(tst.findtext("objFlags") or 0) & LOOP_STOP_IF_TRUE:
+                cond.set("value", "stop")
             for t in inner_terms.get(tst.get("uid"), []):
                 self.term_owner[t.get("uid")] = (cond, "value", True)
             self._pending_children = getattr(self, "_pending_children", [])
@@ -1227,7 +1370,7 @@ class Reader:
         children = []
         rank = self._tunnel_ranks(node, "lpTun")
         for term in node.find("termList"):
-            d = term.find("dco")
+            d = self.dco_def(term.find("dco"))
             if d is None:
                 continue
             dc = d.get("class")
@@ -1353,7 +1496,7 @@ class Reader:
             ddo = sp.findtext("ddoUID") or "0"
             ctl = self.ctl_by_ddo.get(ddo) if ddo != "0" else None
             # NI's selector names a control TRIMMED: `"Stop Button"` for a label padded with blanks
-            src = '"%s"' % ctl.get("_name").strip() if ctl is not None else None
+            src = '"%s"' % label_of(ctl.get("_name")).strip() if ctl is not None else None
             k = int(sp.findtext("dynIndex") or 0)
             if src is None and 0 < k <= len(dyn) and dyn[k - 1]:
                 src = "<%s>" % dyn[k - 1]
@@ -1393,7 +1536,7 @@ class Reader:
                 if d is not None and t.get("class") == "term":
                     ts.setdefault(d.get("uid"), []).append(t)
             frame_srn_terms.append(ts)
-        sel_strings = [bytes.fromhex(x.text).decode("mac_roman") if x.text else ""
+        sel_strings = [lvheap.value_text(bytes.fromhex(x.text)) if x.text else ""
                        for x in node.findall("SelectStringArray/SL__arrayElement")]
         sel_tree = None
         frame_els = []
@@ -1407,7 +1550,7 @@ class Reader:
         outer_tunnels = []
         rank = self._tunnel_ranks(node, "selTun")
         for term in node.find("termList"):
-            d = term.find("dco")
+            d = self.dco_def(term.find("dco"))
             if d is None:
                 continue
             dc = d.get("class")
@@ -1477,10 +1620,10 @@ class Reader:
             else:
                 def val(v):
                     if st == "String":
-                        return '"%s"' % sel_strings[v] if 0 <= v < len(sel_strings) else str(v)
+                        return '"%s"' % esc_case_text(sel_strings[v]) if 0 <= v < len(sel_strings) else str(v)
                     if labels:
                         # QUOTED, as NI's exporter writes an enum item (`"State 1"`, t97)
-                        return '"%s"' % labels[v] if 0 <= v < len(labels) else str(v)
+                        return '"%s"' % esc_case_text(labels[v]) if 0 <= v < len(labels) else str(v)
                     return str(v)
                 if stt == 0 and ett == 0:
                     txt = val(s)
@@ -1986,7 +2129,7 @@ class Reader:
         el.set("fields", ",".join(fields))
         ddo = node.find("ddo")
         if ddo is not None and ddo.get("uid") in self.ctl_by_ddo:
-            el.set("link", self.ctl_by_ddo[ddo.get("uid")].get("_name"))
+            el.set("link", label_of(self.ctl_by_ddo[ddo.get("uid")].get("_name")))
         el.set("type", "{%s}" % cls)
         return el
 
@@ -2093,8 +2236,8 @@ class Reader:
         ddo = node.find("ddo")
         if ddo is not None:
             ctl = self.ctl_by_ddo.get(ddo.get("uid"))
-            name = ctl.get("_name") if ctl is not None else "?"
-            el.set("element", name)
+            el.set("element", ctl.get("_name") if ctl is not None else "?")   # escaped, as NI writes it
+            name = label_of(ctl.get("_name")) if ctl is not None else "?"
         else:
             name = unquote(node.findtext("label/textRec/text") or "This VI")
             tree = self.tid_tree(node.find("termList/SL__arrayElement"))
@@ -2248,13 +2391,25 @@ def main(argv):
     if src.lower().endswith(".xml"):
         main_xml = src
     else:
+        # a VI INSIDE an .llb container file, its path running through the .llb as LabVIEW writes
+        # it: read from the member resolve.py extracted. vi_path below stays the virtual path, so
+        # the VI's relative links still resolve from where LabVIEW sees it
+        real = src
+        if not os.path.exists(src):
+            import resolve
+            real = resolve.materialize(src)
+            if real is None:
+                split = resolve.llb_split(src)
+                sys.exit("No VI at '%s'%s" % (src, "" if split is None else
+                         ": the .llb container '%s' holds no member '%s'" % split))
         tmp = tempfile.mkdtemp(prefix="vi2aixml_")
-        main_xml = lvheap.extract(src, tmp)
+        main_xml = lvheap.extract(real, tmp)
     try:
         root = Reader(main_xml, vi_path=None if src.lower().endswith(".xml") else os.path.abspath(src)).read()
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
+    escape_illegal_xml_chars(root)
     ET.indent(root, "  ")
     text = ET.tostring(root, encoding="unicode")
     if len(argv) > 1:
