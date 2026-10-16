@@ -83,12 +83,7 @@ internal static class LabViewCom
             // where the platform analyzer looks (CA1416), and NotReady above cannot vouch for it
             if (!OperatingSystem.IsWindows())
                 throw new ComException("notWindows", "LabVIEW's ActiveX server is reachable on Windows only.");
-            var type = Type.GetTypeFromProgID(ProgId)
-                ?? throw new ComException("activeXNotRegistered",
-                    $"{ProgId} is not registered, so LabVIEW's ActiveX server cannot be reached. " +
-                    "It is registered by LabVIEW's installer; a repair install restores it.");
-            var app = Activator.CreateInstance(type)
-                ?? throw new ComException("activeXNotRegistered", $"{ProgId} gave no object.");
+            var app = Attach();
             try { return body(app); }
             finally { Release(app); }
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -116,6 +111,63 @@ internal static class LabViewCom
         catch (COMException e)
         {
             throw new ComException("comCallFailed", e.Message);
+        }
+    }
+
+    /// <summary>
+    /// Keep a VI LOADED until the answer is disposed: a reference held on a thread of its own, so
+    /// helpers that open the VI by path one after the other reach the copy in memory instead of
+    /// loading it again. Measured 2026-10-16: a Caraya test VI takes 1.6-2.5 s to load cold, and
+    /// lvai_layout_diagram loaded each one twice, once for its dump and once for its apply.
+    /// Null when nothing could be held - an optimisation, never a precondition: the caller goes on
+    /// without it. A pylabview edit of the file must not run while a hold stands, or LabVIEW keeps
+    /// serving the copy it holds.
+    /// </summary>
+    public static async Task<IAsyncDisposable?> HoldAsync(string viPath, int timeoutSeconds, CancellationToken ct)
+    {
+        if (NotReady() is not null || !OperatingSystem.IsWindows()) return null;
+        var opened = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new ManualResetEventSlim(false);
+        var thread = new Thread(() =>
+        {
+            object? app = null, vi = null;
+            try
+            {
+                if (!OperatingSystem.IsWindows()) { opened.TrySetResult(false); return; }
+                app = Attach();
+                vi = Call(app, "GetVIReference", Path.GetFullPath(viPath));
+                opened.TrySetResult(vi is not null);
+                if (vi is not null) release.Wait();
+            }
+            catch (Exception e) when (e is TargetInvocationException or COMException or ArgumentException
+                                          or ComException)
+            {
+                opened.TrySetResult(false);
+            }
+            finally
+            {
+                if (vi is not null) Release(vi);
+                if (app is not null) Release(app);
+            }
+        }) { IsBackground = true, Name = "LabVIEW VI hold" };
+        thread.Start();
+        bool held;
+        try { held = await opened.Task.WaitAsync(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 1, 3600)), ct); }
+        catch (Exception e) when (e is TimeoutException or OperationCanceledException) { held = false; }
+        if (held) return new Hold(release, thread);
+        release.Set();
+        return null;
+    }
+
+    private sealed class Hold(ManualResetEventSlim release, Thread thread) : IAsyncDisposable
+    {
+        public ValueTask DisposeAsync()
+        {
+            release.Set();
+            // the reference is released on its own thread; a COM call that hangs there must not
+            // hang the caller, so it gets a few seconds and is left behind after that
+            thread.Join(TimeSpan.FromSeconds(5));
+            return ValueTask.CompletedTask;
         }
     }
 
@@ -161,6 +213,41 @@ internal static class LabViewCom
 
     /// <summary>Print.VI To HTML's Format: {Custom, Standard, Using Panel, Using SubVI, Complete}.</summary>
     internal const int PrintFormatStandard = 1;
+
+    /// <summary>
+    /// LabVIEW's Application object - of the LabVIEW that RUNS, never a new one. LabVIEW does not
+    /// register in the running-object table (GetActiveObject answers MK_E_UNAVAILABLE on an IDE
+    /// started by hand), so the object is CREATED, which reaches the running instance - unless that
+    /// instance does not answer, hung after a crash: COM then STARTS a second LabVIEW with
+    /// /Automation -Embedding. Such a LabVIEW quits as soon as the call releases it, and with JKI's
+    /// SDP running it asks first, "Quitting aborts all running VIs" - a modal on the user's screen;
+    /// the next call started the next one, four in fifteen minutes (2026-10-16). So the processes
+    /// are compared around the creation, and a LabVIEW this call started is ended at once.
+    /// </summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static object Attach()
+    {
+        var type = Type.GetTypeFromProgID(ProgId)
+            ?? throw new ComException("activeXNotRegistered",
+                $"{ProgId} is not registered, so LabVIEW's ActiveX server cannot be reached. " +
+                "It is registered by LabVIEW's installer; a repair install restores it.");
+        var before = RunningPids();
+        var app = Activator.CreateInstance(type)
+            ?? throw new ComException("activeXNotRegistered", $"{ProgId} gave no object.");
+        var started = RunningPids().Except(before).ToList();
+        if (started.Count == 0) return app;
+        Release(app);
+        foreach (var id in started)
+        {
+            try { using var p = System.Diagnostics.Process.GetProcessById(id); p.Kill(); }
+            catch (Exception e) when (e is ArgumentException or InvalidOperationException
+                                          or System.ComponentModel.Win32Exception) { }
+        }
+        throw new ComException("labviewNotAnswering",
+            "The running LabVIEW did not answer over ActiveX, so COM started a second LabVIEW for " +
+            "this call; it was ended again. The running one is probably hung - after a crash, or " +
+            "behind a dialog. Close the dialog, or restart LabVIEW (lvai_ensure_labview starts it).");
+    }
 
     /// <summary>The ids of every running LabVIEW - taken before a call that may kill one.</summary>
     public static IReadOnlySet<int> RunningPids()
