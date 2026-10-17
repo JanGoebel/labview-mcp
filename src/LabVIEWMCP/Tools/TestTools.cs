@@ -826,6 +826,7 @@ internal sealed class TestTools(LvaiConnection connection)
                     "THE TEST VI WAS WRITTEN and still calls the sockets, so it would test " +
                     "nothing. Read the swap step - `socketsNotOnDiagram` and `socketsLeft` say " +
                     "which half failed.", route: route);
+            await TestTools.AddFinalDiagramSizeAsync(connection, steps, testViPath, timeoutSeconds, ct);
 
             if (!keepAixml)
             {
@@ -1045,6 +1046,7 @@ internal sealed class TestTools(LvaiConnection connection)
                     "THE TEST VI WAS WRITTEN and calls the real accessors, but its seed constants are " +
                     "still paths, so it cannot run. Read the seeds step.", route: Direct(route)), null);
             }
+            await TestTools.AddFinalDiagramSizeAsync(connection, steps, testViPath, timeoutSeconds, ct);
         }
 
         // 5b. a written value feeding a TYPEDEF terminal carries the typedef, or it wears a dot
@@ -1199,16 +1201,22 @@ internal sealed class TestTools(LvaiConnection connection)
         are swept as on every close. A path with no file behind it is NOT listed (`notOnDisk`).
         `lvai_open_file` refuses a project that lists a file twice (`duplicateProjectEntries`);
         this call with that projectPath and the VIs you meant to list is the repair.
+        TARGET LEVEL ONLY WHEN ASKED: `targetLevel: true` lists the VIs directly under My Computer,
+        beside the classes and libraries - a top-level application VI, say - and then a VI already
+        at target level stays there. Without it every VI goes into a folder, because an entry at
+        target level is also what LabVIEW's own save writes for a VI it adopts.
         """)]
     public async Task<string> AddVisToProjectAsync(
         [Description("The .lvproj to list the VIs in")] string projectPath,
         [Description("The VIs to list, one absolute path per line")] string viPaths,
-        [Description("Virtual folder to list them under; created at target level if missing. Every " +
-                     "VI goes into a folder - there is no target-level listing - so NAME IT for what it " +
-                     "holds: the default suits subVIs, a top-level GUI belongs in e.g. \"Application\"")]
+        [Description("Virtual folder to list them under; created at target level if missing. NAME " +
+                     "IT for what it holds: the default suits subVIs. Ignored with targetLevel")]
         string folderName = "SubVIs",
         [Description("Open the project again afterwards. Leave false when the next step generates")]
         bool reopen = false,
+        [Description("List the VIs directly under My Computer instead of in a folder - for a " +
+                     "top-level VI the user starts from the Project Explorer")]
+        bool targetLevel = false,
         [Description("Local budget in seconds")] int timeoutSeconds = 300,
         CancellationToken ct = default,
         [Description(AixmlBackend.RouteParameterDescription)] string? backend = null) =>
@@ -1222,19 +1230,21 @@ internal sealed class TestTools(LvaiConnection connection)
             if (PathListFault(viPaths, nameof(viPaths)) is { } listFault)
                 return Json.Error("badArguments", listFault,
                     new { parameter = nameof(viPaths), arrived = viPaths });
-            if (string.IsNullOrWhiteSpace(folderName))
+            if (!targetLevel && string.IsNullOrWhiteSpace(folderName))
                 return Json.Error("badArguments",
-                    "folderName is empty. Name the virtual folder the VIs belong under - an entry " +
-                    "at target level is exactly what LabVIEW's own save produces, so it cannot be " +
-                    "told apart from an adopted stray afterwards.");
+                    "folderName is empty. Name the virtual folder the VIs belong under, or pass " +
+                    "targetLevel: true to list them directly under My Computer - an empty folder " +
+                    "name is not taken to mean target level, because that is also what LabVIEW's " +
+                    "own save writes for a VI it adopts.");
 
             var paths = (viPaths ?? "")
                 .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries |
                                      StringSplitOptions.TrimEntries)
                 .ToList();
-            var step = await ListInProjectAsync(Path.GetFullPath(projectPath), folderName.Trim(),
+            var step = await ListInProjectAsync(Path.GetFullPath(projectPath),
+                                                targetLevel ? "" : folderName.Trim(),
                                                 paths, timeoutSeconds, ct, reopen,
-                                                moveTargetLevel: true);
+                                                moveTargetLevel: !targetLevel);
             return Json.Document(step);
         });
 
@@ -1756,9 +1766,13 @@ internal sealed class TestTools(LvaiConnection connection)
             // stays where it is.
             // `moveTargetLevel` - the explicit listing tool - moves a requested VI out of target
             // level whoever put it there: the caller named the VI AND the folder.
-            var adopted = JustAdopted(entries.Select(e => e.Name),
-                                      moveTargetLevel ? [] : listedBefore.Select(v => v.Name),
-                                      LvClass.ListedViPlaces(projectPath));
+            // AT TARGET LEVEL NOTHING IS MOVED: an entry LabVIEW's save made there is already where
+            // the caller asked for it.
+            var adopted = folderName.Length == 0
+                ? []
+                : JustAdopted(entries.Select(e => e.Name),
+                              moveTargetLevel ? [] : listedBefore.Select(v => v.Name),
+                              LvClass.ListedViPlaces(projectPath));
             var moved = LvClass.RemoveTargetLevelVis(projectPath, adopted);
 
             // RESTORE, ADD, THEN TIDY - in that order. Tidy last is what makes the pass safe: it
@@ -1774,9 +1788,9 @@ internal sealed class TestTools(LvaiConnection connection)
                 ? LvClass.AddVisToProject(projectPath, folderName, entries)
                 : 0;
 
-            var (tidied, removed, _) = ClassTools.StripHelperItems(
-                await File.ReadAllTextAsync(projectPath, ct), projectPath);
-            if (removed > 0) await File.WriteAllTextAsync(projectPath, tidied, ct);
+            var (projectText, projectStyle) = LvTextFile.Read(projectPath);
+            var (tidied, removed, _) = ClassTools.StripHelperItems(projectText, projectPath);
+            if (removed > 0) await LvTextFile.WriteAsync(projectPath, tidied, projectStyle, ct);
 
             // AND NO FILE LISTED TWICE, whoever wrote the second entry: that project answers
             // `Error 74` on the next open. AddVisToProject never adds one; this repairs one made
@@ -1808,6 +1822,7 @@ internal sealed class TestTools(LvaiConnection connection)
             step["added"] = added;
             step["restored"] = restored;
             step["folder"] = folderName;
+            step["targetLevel"] = folderName.Length == 0;
             // THE REQUESTED FOLDER, AS A FIELD RATHER THAN A SENTENCE. Measured 2026-09-15 on the
             // WeighBridge build: two calls with identical arguments (`testFolderName: "Tests"`)
             // produced two different layouts - one runner under `Tests`, the other left at target
@@ -1848,7 +1863,7 @@ internal sealed class TestTools(LvaiConnection connection)
                          string.Join(", ", notListed.Select(v => $"'{v}'")) +
                          ". The tidy pass took them back out; list them by hand with the project " +
                          "CLOSED, because LabVIEW's close saves over the file.");
-            if (added > 0) note.Add($"Listed under '{folderName}'.");
+            if (added > 0) note.Add(folderName.Length == 0 ? "Listed at target level." : $"Listed under '{folderName}'.");
             else if (notOnDisk.Count == 0 && notListed.Count == 0)
                 note.Add("Already listed; nothing added.");
             if (moved.Count > 0)
@@ -1869,7 +1884,7 @@ internal sealed class TestTools(LvaiConnection connection)
                                                                   StringComparer.OrdinalIgnoreCase))
                                   .ToList();
             if (chosen.Count > 0)
-                note.Add("BUT NOT UNDER '" + folderName + "': " +
+                note.Add((folderName.Length == 0 ? "BUT NOT AT TARGET LEVEL: " : "BUT NOT UNDER '" + folderName + "': ") +
                          string.Join(", ", chosen.Select(e => $"'{e.Name}' is in {e.Folder}")) +
                          ". Left there deliberately - only an entry THIS call's own save created " +
                          "at target level is moved, and this one was in the project before the " +
@@ -2534,7 +2549,7 @@ internal sealed class TestTools(LvaiConnection connection)
     }
 
     /// <summary>The text inside the type's outermost braces, or null when they are unbalanced.</summary>
-    private static string? Braced(string type)
+    internal static string? Braced(string type)
     {
         var open = type.IndexOf('{');
         if (open < 0) return null;
@@ -2551,7 +2566,7 @@ internal sealed class TestTools(LvaiConnection connection)
     /// Split a cluster's member list on the commas that are SEPARATORS - the ones at brace depth
     /// zero. A nested cluster carries its own commas and must not be torn apart by them.
     /// </summary>
-    private static List<string> SplitTopLevel(string inner)
+    internal static List<string> SplitTopLevel(string inner)
     {
         var parts = new List<string>();
         var depth = 0;
@@ -2577,7 +2592,7 @@ internal sealed class TestTools(LvaiConnection connection)
     /// may itself contain one (<c>double.Max. Spannung</c>) and <c>array.2{double}</c> carries a
     /// dot in the TYPE. Both spellings are attested in NI's own exports.
     /// </summary>
-    private static string FieldType(string member)
+    internal static string FieldType(string member)
     {
         var depth = 0;
         var lastClose = -1;
@@ -3462,12 +3477,44 @@ internal sealed class TestTools(LvaiConnection connection)
     /// 4345 x 4084 px, and nothing said so, because the test generators passed
     /// <c>measureDiagram: false</c> on the grounds that a test VI was internal.
     /// </summary>
-    internal static JsonObject? GeneratedDiagramSize(JsonArray steps) =>
-        steps.OfType<JsonObject>()
+    internal static JsonObject? GeneratedDiagramSize(JsonArray steps)
+    {
+        // a re-measure after a later layout wins: that is the diagram the caller gets
+        if (steps.OfType<JsonObject>().LastOrDefault(s => s["step"]?.GetValue<string>() == "diagramSize")
+            is { } final && final["size"] is JsonObject after)
+            return (JsonObject)after.DeepClone();
+        return steps.OfType<JsonObject>()
              .LastOrDefault(s => s["step"]?.GetValue<string>() == "generate")?["answer"]
              is JsonObject answer && answer["diagramSize"] is JsonObject size
             ? (JsonObject)size.DeepClone()
             : null;
+    }
+
+    /// <summary>
+    /// Measures the test VI again when a step AFTER the generate laid its diagram out once more -
+    /// the swap or seeds step's own clean-up. Until 2026-10-17 `diagramSize` was the generate
+    /// step's render, taken before that layout: a grpc build reported 758 x 462 and 668 x 527 for
+    /// diagrams the later layout made 876 x 509 and 1080 x 264. Adds nothing when nothing was
+    /// measured to begin with (measureDiagram: false) or no later step laid the diagram out.
+    /// </summary>
+    internal static async Task AddFinalDiagramSizeAsync(LvaiConnection connection, JsonArray steps,
+                                                       string viPath, int timeoutSeconds,
+                                                       CancellationToken ct)
+    {
+        var list = steps.OfType<JsonObject>().ToList();
+        var generate = list.FindLastIndex(s => s["step"]?.GetValue<string>() == "generate");
+        if (generate < 0 || (list[generate]["answer"] as JsonObject)?["diagramSize"] is not JsonObject) return;
+        var laidOutLater = list.Skip(generate + 1)
+            .Any(s => (s["answer"] as JsonObject)?["cleanUpDiagram"] is JsonObject);
+        if (!laidOutLater) return;
+        var size = await new BulkTools(connection).DiagramSizeStepAsync(null, viPath, timeoutSeconds, ct);
+        steps.Add(new JsonObject
+        {
+            ["step"] = "diagramSize",
+            ["size"] = size,
+            ["note"] = "Measured again after the layout a later step ran; this is the size reported.",
+        });
+    }
 
     /// <summary>The `measureDiagram` switch of the three Caraya test generators.</summary>
     internal const string MeasureTestDiagramDescription = """

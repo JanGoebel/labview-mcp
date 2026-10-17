@@ -195,14 +195,41 @@ public sealed class WireEventToolsTests
     }
 
     [Fact]
-    public void AMissingEventStructureNamesTheSearchDepthRatherThanFailingBlankly()
+    public void AMissingEventStructureNamesTheSearchRatherThanFailingBlankly()
     {
         var outcome = WireEventTools.Classify(found: false, code: 0, sourceFrom: null,
                                               wiredBefore: null, endsAfter: null, broken: null);
 
         Assert.False(outcome.Ok);
         Assert.Equal("noEventStructureFound", outcome.Kind);
-        Assert.Contains("one level", outcome.Note);
+        // The search is Traverse now, so depth is no longer the explanation for a miss - and the
+        // note must not keep sending the reader there, which is what the two-level text did.
+        Assert.Contains("any depth", outcome.Note);
+        Assert.Contains("Traverse for GObjects", outcome.Note);
+        Assert.DoesNotContain("one level", outcome.Note);
+    }
+
+    [Fact]
+    public void SeveralEventStructuresAreNamedInTheNoteBecauseOnlyTheFirstIsWired()
+    {
+        var outcome = WireEventTools.Classify(found: true, code: 0, sourceFrom: "tunnel",
+                                              wiredBefore: false, endsAfter: 3, broken: false,
+                                              eventStructures: 2);
+
+        Assert.True(outcome.Ok);
+        Assert.Contains("2 Event Structures", outcome.Note);
+        Assert.Contains("FIRST", outcome.Note);
+    }
+
+    [Fact]
+    public void OneEventStructureAddsNoMultiplicityNote()
+    {
+        var outcome = WireEventTools.Classify(found: true, code: 0, sourceFrom: "tunnel",
+                                              wiredBefore: false, endsAfter: 3, broken: false,
+                                              eventStructures: 1);
+
+        Assert.True(outcome.Ok);
+        Assert.DoesNotContain("Event Structures were found", outcome.Note);
     }
 
     [Fact]
@@ -237,7 +264,7 @@ public sealed class WireEventToolsTests
     }
 
     [Fact]
-    public void TheShippedHelperWiresAutoRouteTrueAndSearchesTwoLevels()
+    public void TheShippedHelperWiresAutoRouteTrueAndSearchesAtAnyDepth()
     {
         var aixml = Path.Combine(RepoRoot(), "scripts", WireEventTools.HelperAixmlFileName);
         if (!File.Exists(aixml)) return;   // binary-only checkout
@@ -250,10 +277,17 @@ public sealed class WireEventToolsTests
         Assert.Contains("Auto Route? (F):", text);
         Assert.Contains("Auto Wire? (T):", text);
 
-        // And the classes the search descends into. A structure class missing from this list is
-        // not searched, which the tool reports as "not found" with the classes it did see.
+        // The search is NI's Traverse, in the spelling lvai_swap_subvis.xml already uses, for the
+        // structure AND for the fallback node. The hand-written two-level search listed container
+        // classes to descend into and missed an Event Structure in a Case frame in a While Loop;
+        // a container list reappearing here would be that search coming back.
+        Assert.Contains("VI Scripting - Traverse.lvlib\\3ATraverse for GObjects.vi", text);
+        Assert.Contains("value=\"EventStructure\"", text);
+        Assert.Contains("type=\"uint16{FP,BD,Other}\"", text);
+        Assert.Contains("Traverse Generated Code (F):", text);
         foreach (var container in new[] { "WhileLoop", "ForLoop", "TimedLoop", "CaseStructure" })
-            Assert.Contains($"value=\"{container}\"", text);
+            Assert.DoesNotContain($"value=\"{container}\"", text);
+        Assert.Contains("_name=\"event structures\"", text);
 
         // The name both ends answer to, and the reason no index is hardcoded.
         Assert.Contains($"value=\"{WireEventTools.RefnumTerminalName}\"", text);
@@ -267,6 +301,169 @@ public sealed class WireEventToolsTests
         // Both routes must be reportable, or a caller cannot tell a branch from a fresh wire.
         Assert.Contains("value=\"tunnel\"", text);
         Assert.Contains("value=\"diagram\"", text);
+    }
+
+    // ------------------------------------------------------------------ right side
+
+    [Fact]
+    public void NoUnregisterNodeIsASkipNamedTheWayTheAnswerSpellsIt()
+    {
+        var right = WireEventTools.ClassifyRightSide(true, unregisterNodes: 0, sourceFound: true,
+            wiredBefore: false, attempted: false, code: 0, endsAfter: 0, broken: false);
+
+        Assert.Equal("skipped", right.Status);
+        Assert.Equal("noUnregisterForEvents", right.Reason);
+        Assert.False(right.Failed);
+        Assert.False(right.MayHaveCreatedTunnels);
+
+        // The shape the caller reads: rightSide: {skipped: "noUnregisterForEvents"}.
+        var json = right.ToJson(0, false, false, 0, "", 0, false);
+        Assert.Equal("noUnregisterForEvents", json["skipped"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public void SeveralUnregisterNodesAreRefusedWithTheCount()
+    {
+        var right = WireEventTools.ClassifyRightSide(true, unregisterNodes: 2, sourceFound: true,
+            wiredBefore: false, attempted: false, code: 0, endsAfter: 0, broken: false);
+
+        Assert.Equal("refused", right.Status);
+        Assert.Equal("multipleUnregisterForEvents", right.Reason);
+        Assert.Contains("2 nodes", right.Note);
+        Assert.False(right.Failed);   // a refusal is reported, it does not fail the left side
+
+        var json = right.ToJson(2, false, false, 0, "", 0, false);
+        Assert.Equal("multipleUnregisterForEvents", json["refused"]?.GetValue<string>());
+        Assert.Equal(2, json["unregisterNodes"]?.GetValue<int>());
+    }
+
+    [Fact]
+    public void AnAlreadyWiredUnregisterInputIsANoOp()
+    {
+        // The usual generated shape: AIXML wires Register For Events straight into Unregister.
+        var right = WireEventTools.ClassifyRightSide(true, unregisterNodes: 1, sourceFound: true,
+            wiredBefore: true, attempted: false, code: 0, endsAfter: 0, broken: false);
+
+        Assert.Equal("alreadyWired", right.Status);
+        Assert.False(right.Failed);
+        Assert.False(right.MayHaveCreatedTunnels);
+        Assert.Contains("no-op", right.Note);
+    }
+
+    [Fact]
+    public void ALandedRightWireIsWiredAndMayHaveMadeTunnels()
+    {
+        var right = WireEventTools.ClassifyRightSide(true, unregisterNodes: 1, sourceFound: true,
+            wiredBefore: false, attempted: true, code: 0, endsAfter: 2, broken: false);
+
+        Assert.Equal("wired", right.Status);
+        Assert.False(right.Failed);
+        Assert.True(right.MayHaveCreatedTunnels);   // this is what gates the Use Default step
+    }
+
+    [Theory]
+    [InlineData(1062, 0, false, "failed")]
+    [InlineData(0, 0, false, "didNotLand")]
+    [InlineData(0, 2, true, "broken")]
+    public void AnAttemptedRightWireThatDidNotLandIsAFailure(int code, int ends, bool broken,
+                                                             string status)
+    {
+        var right = WireEventTools.ClassifyRightSide(true, unregisterNodes: 1, sourceFound: true,
+            wiredBefore: false, attempted: true, code: code, endsAfter: ends, broken: broken);
+
+        Assert.Equal(status, right.Status);
+        Assert.True(right.Failed);
+    }
+
+    [Fact]
+    public void UnreadableRightSideIndicatorsAreUnknownAndStillLetTheBundleStepLook()
+    {
+        // RunVIAsTopLevel's Error 91 read-back artefact: nothing came back. The Use Default step
+        // is gated on its own uid diff, so letting it look costs an extract and cannot patch a
+        // tunnel this call did not make.
+        var right = WireEventTools.ClassifyRightSide(true, null, null, null, null, null, null, null);
+
+        Assert.Equal("unknown", right.Status);
+        Assert.False(right.Failed);
+        Assert.True(right.MayHaveCreatedTunnels);
+    }
+
+    [Fact]
+    public void NotRequestedTouchesNothing()
+    {
+        var right = WireEventTools.ClassifyRightSide(false, 1, true, false, false, 0, 0, false);
+
+        Assert.Equal("notRequested", right.Reason);
+        Assert.False(right.MayHaveCreatedTunnels);
+        // measured 2026-10-13: the VI then stays not executable, and the note must say why
+        Assert.Contains("UNWIRED", right.Note);
+    }
+
+    [Fact]
+    public void ARightSideTheHelperNeverReachedIsNotReadAsNoUnregisterNode()
+    {
+        // Measured 2026-10-13 with no project active: every right-side indicator holds its
+        // default, and 0 Unregister nodes was reported as noUnregisterForEvents.
+        var right = WireEventTools.ClassifyRightSide(true, 0, false, false, false, 0, 0, false,
+                                                     reached: false);
+
+        Assert.Equal("notReached", right.Reason);
+        Assert.False(right.Failed);
+        Assert.False(right.MayHaveCreatedTunnels);
+    }
+
+    [Fact]
+    public void ParsesTheUseDefaultScriptsLastTwoLines()
+    {
+        var (result, uids) = WireEventTools.ParseUseDefault(
+            "selTun before: 13, after: 15, new: 528,560\n" +
+            "   case 4310 output selTun 560 flags 0x100801 -> 0x300801 (unwired inner terminal(s) 566)\n" +
+            "USE_DEFAULT_SET: 560\nRESULT: changed\n");
+
+        Assert.Equal("changed", result);
+        Assert.Equal(new[] { "560" }, uids);
+
+        var (refused, none) = WireEventTools.ParseUseDefault(
+            "REFUSED: 1 tunnel uid(s) ...\r\nUSE_DEFAULT_SET: \r\nRESULT: refused\r\n");
+        Assert.Equal("refused", refused);
+        Assert.Empty(none);
+
+        Assert.Null(WireEventTools.ParseUseDefault(null).Result);
+    }
+
+    [Fact]
+    public void TheBundleNoteSaysWhichJobChangedTheFileAndThatTheProjectWasClosed()
+    {
+        var note = WireEventTools.BundleStepNote(userEvents: false, useDefault: true, executable: true);
+
+        Assert.Contains("Use Default if Unwired", note);
+        Assert.Contains("EXECUTABLE", note);
+        Assert.Contains("CLOSED", note);
+        Assert.DoesNotContain("user-event", note);
+    }
+
+    [Fact]
+    public void TheShippedHelperWiresTheRightSideOnItsOwnErrorBranch()
+    {
+        var aixml = Path.Combine(RepoRoot(), "scripts", WireEventTools.HelperAixmlFileName);
+        if (!File.Exists(aixml)) return;   // binary-only checkout
+        var text = File.ReadAllText(aixml);
+
+        // the input the tool sets, and the Unregister search: Traverse for Function, filtered on
+        // the EXACT class and on a SINK named in lower case
+        Assert.Contains("_name=\"wire right side\"", text);
+        Assert.Contains("value=\"Function\"", text);
+        Assert.Contains("value=\"event registration refnum\"", text);
+
+        // the conditional wire, and the save fed by the LEFT error passed through the case - the
+        // right side's own error must not reach Save.Instrument
+        Assert.Contains("<Structure _name=\"Case Structure\" selectin=\"4750.go\"", text);
+        Assert.Contains("error in (no error):4850.err", text);
+        Assert.DoesNotContain("error in (no error):4851.rightErr", text);
+
+        foreach (var name in new[] { "unregister nodes", "right attempted", "right code",
+                                     "right wire ends", "right wired before" })
+            Assert.Contains($"_name=\"{name}\"", text);
     }
 
     // This walk was already worktree-correct; it now shares one implementation with the rest,
@@ -316,12 +513,80 @@ public sealed class WireEventToolsTests
         Assert.Equal("helperDidNotAnswer", outcome.Kind);
     }
 
-    /// <summary>A helper that reported its OWN code is a different failure and keeps its verdict.</summary>
+    /// <summary>
+    /// Since 2026-10-13 the helper's `code` ARRIVES, so a missing project now reads 1055 rather
+    /// than null. The empty class list still decides it; a 1055 with classes read is the refnum
+    /// search failing, which keeps its own verdict.
+    /// </summary>
+    [Fact]
+    public void A1055WithNoClassesReadIsStillNoActiveProject()
+    {
+        var noProject = WireEventTools.Classify(
+            found: false, code: 1055, sourceFrom: "", wiredBefore: false, endsAfter: null,
+            broken: false, helperErrorSource: "Property Node in lvai_wire_dyn_events.vi",
+            topClasses: [""]);
+        var noRefnum = WireEventTools.Classify(
+            found: true, code: 1055, sourceFrom: "", wiredBefore: false, endsAfter: null,
+            broken: false, helperErrorSource: "Property Node in lvai_wire_dyn_events.vi",
+            topClasses: ["WhileLoop"]);
+
+        Assert.Equal("noActiveProject", noProject.Kind);
+        Assert.Equal("noRefnumSourceFound", noRefnum.Kind);
+    }
+
+    /// <summary>
+    /// MEASURED 2026-10-13: RunVIAsTopLevel answered Error 91 at Variant To Data and returned every
+    /// bool and int32 indicator EMPTY, so the right side read "unknown" on every run and a re-run
+    /// read helperDidNotAnswer. Those indicators are Flatten To XML strings now; these are the
+    /// shapes LabVIEW writes.
+    /// </summary>
+    [Theory]
+    [InlineData("<Boolean>\r\n<Name>found</Name>\r\n<Val>TRUE</Val>\r\n</Boolean>\r\n", true)]
+    [InlineData("<Boolean>\n<Name></Name>\n<Val>FALSE</Val>\n</Boolean>\n", false)]
+    [InlineData("TRUE", true)]
+    public void AFlattenedBooleanIsRead(string text, bool expected) =>
+        Assert.Equal(expected, WireEventTools.ParseFlag(text));
+
+    [Theory]
+    [InlineData("<I32>\r\n<Name>code</Name>\r\n<Val>1055</Val>\r\n</I32>\r\n", 1055)]
+    [InlineData("<I32>\n<Name></Name>\n<Val>-3</Val>\n</I32>\n", -3)]
+    [InlineData("7", 7)]
+    public void AFlattenedNumberIsRead(string text, int expected) =>
+        Assert.Equal(expected, WireEventTools.ParseNumber(text));
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("<Boolean><Name></Name></Boolean>")]
+    [InlineData("<not xml")]
+    public void AnUnreadableValueIsNull(string? text)
+    {
+        Assert.Null(WireEventTools.ParseFlag(text));
+        Assert.Null(WireEventTools.ParseNumber(text));
+    }
+
+    [Fact]
+    public void EveryHelperIndicatorIsAString()
+    {
+        // A bool or int32 indicator comes back empty from RunVIAsTopLevel (Error 91), so the
+        // helper must not grow one again.
+        var text = File.ReadAllText(Path.Combine(RepoRoot(), "scripts", "lvai_wire_dyn_events.xml"));
+        var indicators = System.Text.RegularExpressions.Regex.Matches(text, "<Indicator [^>]*>");
+
+        Assert.NotEmpty(indicators);
+        Assert.All(indicators, m => Assert.Contains("type=\"string\"", m.Value));
+    }
+
+    /// <summary>
+    /// A helper that reported a code OTHER than 1055 is a different failure and keeps its verdict.
+    /// (This asserted 1055 too while `code` never arrived; it arrives since 2026-10-13, and a
+    /// missing project now reads 1055 - see A1055WithNoClassesReadIsStillNoActiveProject.)
+    /// </summary>
     [Fact]
     public void AnAnsweringHelperIsNeverReadAsAMissingProject()
     {
         Assert.False(WireEventTools.LooksLikeNoActiveProject(
-            code: 1055, helperErrorSource: "Property Node in lvai_wire_dyn_events.vi",
+            code: 7, helperErrorSource: "Property Node in lvai_wire_dyn_events.vi",
             topClasses: [""]));
     }
 

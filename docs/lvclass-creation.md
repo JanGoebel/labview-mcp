@@ -24,6 +24,13 @@ The helper that drives them is `scripts/lvai_create_class.xml`. **A project must
 the helper reaches LabVIEW through `Project:Active Project` and finds a parent class only among the
 classes that project has loaded; the tool opens one for you. pylabview is no longer involved.
 
+**A parent from the LabVIEW installation is not listed in the project**, measured 2026-10-17 on a
+grpc build. The tool used to list every parent class beside the new class, for the reader. That put
+`Actor.lvclass` at target level, with a URL running into `Program Files`, where LabVIEW keeps it
+under Dependencies and drops the entry on its next save. A parent under any folder that holds
+`LabVIEW.exe` (vi.lib, user.lib, instr.lib, LVAddons) is left to LabVIEW now; a parent of your own
+is still listed.
+
 Section 1 below is the route this replaced — a private data control built from a converted VI. It
 is kept because every step of it is a thing that does *not* work, and §2a says exactly why.
 
@@ -1801,3 +1808,238 @@ project close every method, an accessor and a message's `Do.vi` still `execState
 `.lvclass`, field name not already present, project active), and the `describe_class` before/after
 is exactly the verify block `lvai_add_to_library` already has. Until then the helper ships under
 `scripts/` and is driven with `lvai_run_vi_and_read_values`: `class path`, `carrier path`.
+
+## 10. Class housekeeping: description, virtual folders, membership - ported 2026-10-12
+
+Four tools that change a class or library AFTER it exists, ported from a field run's helpers
+(LabVIEW 2026 Q3 32-bit, 2026-10-11/12, 15 classes). Each goes through NI's own VI Server, never
+through a hand edit of the `.lvclass`, and each verifies from the FILE LabVIEW saved. What was
+measured in that run is said per tool; what the port adds is marked unmeasured until the
+acceptance run. **§10e is that acceptance run, on BOTH backends (2026-10-17)**: it says which of
+the "unmeasured" marks below it settles, and what the port had to change to get there.
+
+### 10a. `lvai_set_class_description` - `NI.Lib.Description`
+
+`LVClass.Open` on the ACTIVE PROJECT's application instance, write `{LV.LVClassLibrary}`
+`Description`, read it back, `{LV.LVClassLibrary}` `Save`. Measured on 15 classes. A `.lvlib` goes
+the twin route - `Library.Open`, `{LV.Library}` `Description`, `{LV.Library}` `Save` with no path -
+which is NOT measured: `lvserver.rsc`'s ActiveX type library lists `Description` on the `Library`
+interface, the open and the save are measured in other helpers, the write is not.
+
+**The text is stored ANSI.** An arrow (U+2192) written through `Description` came back as `?` - no
+error from the write, the read-back or the save. The tool therefore refuses any character outside
+Windows-1252 before LabVIEW is touched (`textNotCp1252`), names each one with its position and an
+ASCII replacement where one is obvious (`->` for the arrow), and returns `suggestedText` when every
+offender has one. Control characters other than TAB, CR and LF are refused too: two of them carry a
+line break to the typed run helper. Line breaks are written CRLF, which is how NI's own files store a
+multi-line class description (`Last Ack.lvclass` in `vi.lib`, read 2026-10-12).
+
+**The verdict is the saved file.** The `.lvclass` is re-read as XML after the save and its
+`NI.Lib.Description` compared with the text, line breaks as LF because an XML reader normalises
+CRLF. LabVIEW's own read-back is reported beside it (`labviewReadBackMatches`) and never decides:
+it reads the class in MEMORY, which a save that did not reach the disk leaves just as correct.
+`filesChanged` lists every file under the owner's folder whose write time or length moved, so
+"saves only that file" is checked rather than assumed - `ok` is false when anything else changed.
+
+**New in the port, unmeasured:** a class or library that already carries unsaved changes
+(`{LV.Library}` `Modifications Bit Set` nonzero) is left alone, because its `Save` would write those
+changes too (`ownerHasUnsavedChanges`). An empty text is refused - an empty value does not survive
+the run helper's name/value pairing - so clearing a description is not supported.
+
+### 10b. `lvai_move_to_folder` - members into a virtual folder
+
+A virtual folder exists only in the `.lvclass` / `.lvlib` XML. Moving a member into one moves no
+file, changes no qualified name and relinks nothing, which is why the user called it routine on
+2026-10-12 ("can be done at will"). The route, measured on every member of 15 classes in the field
+run: `{LV.Library}` `AddItem` with Type `Folder` (empty path) creates the folder, `Get All
+Descendents` with Type `VI` lists the members, `{LV.ProjectItem}` `Name` names each, `{LV.ProjectItem}`
+`Move` with the folder item as `New Parent` moves one, `{LV.LVClassLibrary}` `Save` writes the class.
+The helpers are `scripts/lvai_move_to_folder_class.xml` and its `.lvlib` twin
+`scripts/lvai_move_to_folder_library.xml` (`Library.Open`, `{LV.Library}` `Save` with no path) -
+the twin is unmeasured.
+
+**Refused from the file, before LabVIEW:** a name that is not a member (the answer lists the
+members), the private data control, a `Property Definition`, an accessor INSIDE a property
+definition (taking it out of the definition is not measured, so it is not offered), items of more
+than one type in one call (the helper lists members with ONE `Get All Descendents` type), a folder
+name that occurs twice in the owner, a missing folder with `createFolder: false`, and a folder
+PATH such as `A/B`. The path is refused rather than half-honoured: the helper finds a folder by
+NAME and creates a missing one at the ROOT, so `A/B` would become a root folder called `B` - or
+land in a different `B`. An existing nested folder is reached by its own name when that name is
+unique. An item already in the folder is skipped (`alreadyThere`); a call where every item is
+already there answers `ok` without reaching LabVIEW.
+
+**All or nothing, new in the port and unmeasured.** The helper looks every requested name up
+first; if `Get All Descendents` did not list one (`itemsNotFoundByLabview`, e.g. if a `.ctl` member
+is not listed under Type `VI` - that is not measured either way), or the owner already carries
+unsaved changes (`ownerHasUnsavedChanges`), it creates no folder and moves nothing. A partial move
+would have left a modified, unsaved class in memory for the next save to write.
+
+**Verified from the saved owner:** each item's parent element in the re-read XML must be the
+folder, every member listed before the call must still be listed (`membersLost`), and no other file
+under the owner's folder may have changed (`otherFilesChanged`).
+
+### 10c. `lvai_set_vi_descriptions` - VI descriptions without a regeneration
+
+A description edit used to be a full regeneration, which costs `Error 1357`, the whole swap cycle
+and an icon reset for one sentence (CLAUDE.md). `{LV.VI}` `VI Description` plus `Save.Instrument`
+changes the description and nothing else. The route was measured by a field run on 2026-10-12 with
+the project CLOSED: each VI opened by path in the DEFAULT application instance, the whole text
+written, read back, saved, the reference closed - 62 descriptions rewritten over a production tree
+and every one equal to the text asked for when the files were compared afterwards, none mismatched.
+
+**The project must be closed, and the tool checks.** It asks `Project:Active Project` first and
+refuses (`projectActive`, naming the project) when one is active: a VI the project holds lives in the
+project's application instance, and saving a second copy of it from the default instance is not a
+route anyone has measured. When the check itself cannot run, the call goes ahead and says so under
+`projectCheck`.
+
+**One helper run per VI, inside one call.** The field run read a record file of `path TAB text`
+lines, which rules out a line break inside a description. Here each description travels as an
+ordinary control value, and the typed run helper already carries a line break encoded (LF as 0x1E,
+CR as 0x1D) and decodes it - so a multi-line description needs no separator of its own. Line breaks
+are written CRLF, which is how NI's own VIs store them in `STRG`.
+
+**Verified per VI from the saved file.** `STRG` holds the description as a big-endian length plus
+CP1252 bytes (read off NI's examples - `Get Cost.vi`: 41 bytes, length 37); it is read back offline
+and compared with the text, line breaks as LF. The icon PIXELS - the `icl8`, `icl4` and `ICON`
+resources - are hashed before and after, and an entry whose icon changed is not `ok`, because this
+call must never touch one. The CP1252 check refuses the whole batch for one bad entry, so entry 40
+of a batch cannot be refused after 39 VIs were already changed. **New in the port, unmeasured:** a VI
+that already carries unsaved changes (the Front Panel or Block Diagram Mods Bitset nonzero) is left alone,
+because `Save.Instrument` would write those changes too.
+
+### 10d. `lvai_add_to_class` - an existing `.ctl` or VI into a class
+
+**Adding a typedef to a class RENAMES it.** `X.ctl` becomes `Class.lvclass:X.ctl`, and every caller
+relinks - but only callers that are LOADED. A caller that is not loaded keeps the old link with no
+dialog and no error (the field run's rename finding, the same mechanism). The field run's route,
+measured on 11 typedefs added to classes with the project open and active (2026-10-11/12): open
+every caller outside the class through the project first, `{LV.ProjectItem}` `AddItem` (Name, Path,
+Type) on the folder item, `Edit LVLibs.lvlib:Save All This Library.vi` on the class - a `.ctl`
+saves only through a library save, because `Open VI Reference` answers 1035 for one - then save the
+callers LabVIEW marks modified. LabVIEW makes the added typedef public.
+
+**Callers are an argument, not a guess.** No helper here can name the callers of a file that is not
+in memory: `scripts/lvai_member_callers.xml` reads `Callers' Names` of VIs ALREADY loaded, which is
+the question a re-run asks and not this one. So `callerPaths` lists them, and they are opened
+through the project before the add. What the tool does offline is scan every `.vi`/`.ctl`/`.vim`
+under the project folder for link records (`LIvi`, `LIfp`, `LIbd`) that name an item's file name as
+a whole length-prefixed string, skipping the class's own members (their `LIBN` names the class, and
+they relink with it). A hit that is not in `callerPaths` refuses the call (`callersNotLoaded`)
+before LabVIEW is touched. It is a heuristic - a same-named file in another folder matches too -
+which is what `acceptUnlistedCallers` is for.
+
+**Only listed callers are saved.** `scripts/lvai_save_modified_vis.xml` lists every VI in memory of
+the project's instance with its Front Panel and Block Diagram Mods Bitsets and saves every one that
+is in the list - modified or not, since the relink sets no bitset (§10e); the rest are reported
+(`modifiedNotSaved`). The same helper runs first in read-only mode, and anything already modified
+refuses the call (`unsavedChangesBefore`), because the class save and the caller saves would write
+it. The kit helper it is ported from saved EVERY modified VI; the restriction is measured in §10e.
+
+**Refused from the files, before LabVIEW:** a file whose own `LIBN` resource names an owner (a
+class member or a library member - `LIBN` is a count plus length-prefixed names, read off NI's
+examples: a member and a class-owned typedef carry one, a loose VI none), a file the class already
+lists, anything but `.vi`/`.ctl`, a nested folder path, an ambiguous folder, a missing folder with
+`createFolder: false`.
+
+**Verified from the files:** the re-read `.lvclass` must list every item at the requested place, and
+each item's own `LIBN` must now name the class - the second check is the one that catches a save
+that never reached the item's file. `filesChanged` lists every file under the project folder (and
+the class folder) whose write time or length moved: that is the "every file it re-saved" list.
+**Unmeasured until acceptance:** the class-root route (AddItem on the class reference rather than a
+folder item), `Type VI` for a `.vi` (the kit used it for typedefs), and every guard.
+
+### 10e. Both backends, 2026-10-17
+
+The four tools take `backend` like every tool that reaches LabVIEW. On `pylabview` each helper is
+COMPOSED (`ComposedHelpers`) and run over ActiveX; the project and the callers are opened through
+`lvai_open_file`, which follows the calling tool's backend. Measured on two fresh fixtures, one per
+backend (`C:\Temp\AfHouse\{P,G}`: a class with two dynamic-dispatch methods, a plain `.lvlib` with
+one VI, a loose `Helper.vi` and a `Caller.vi` that calls it), every call driven over raw stdio:
+
+| call | pylabview | grpc |
+|---|---|---|
+| class description with an arrow | `textNotCp1252`, nothing sent | same |
+| class description, two lines | `verified`, on disk with its line break, only the `.lvclass` changed | same |
+| **library** description | `verified`, only the `.lvlib` changed | same |
+| two methods into a new class folder `Methods` | `verified`, `folderCreated`, only the `.lvclass` changed | same |
+| **library** member into a new folder `Sub` | `verified`, `folderCreated`, only the `.lvlib` changed | same |
+| move of a non-member | `itemNotInOwner` | same |
+| `Helper.vi` into the class, caller NOT listed | `callersNotLoaded`, naming `Caller.vi` | same |
+| `Helper.vi` into the class, `callerPaths: [Caller.vi]` | `verified`; the class and `Helper.vi` changed | same |
+| `Caller.vi` afterwards, cold | state 1, runs (21 -> 42), its link names `HkP.lvclass` | state 1, 42, NI's export `target="HkG.lvclass\3AHelper.vi"` |
+| two VI descriptions, project closed | both `verified`, `iconUnchanged`, state 1 cold, no `VICD` in either file | same |
+| VI descriptions with a project active | `projectActive` | same |
+
+So these marks are settled: the `.lvlib` routes of 10a and 10b, the class-ROOT route and `Type VI`
+for a `.vi` in 10d, and the `callersNotLoaded` and `projectActive` guards.
+
+**The open marks, measured the same day on the same fixtures:**
+
+| what | result | backends |
+|---|---|---|
+| `ownerHasUnsavedChanges` | a probe wrote the class's description through VI Server WITHOUT saving: `{LV.Library}` `Modifications Bit Set` went 0 -> 512, and `lvai_set_class_description` and `lvai_move_to_folder` both refused, nothing written; the same on the `.lvlib`. After the probe saved, the next call went through | both, each call on each |
+| a `.ctl` into the class | `lvai_create_typedef` made a loose `uint16{Off,On}` typedef; `lvai_add_to_class` added it, `verified`, its `LIBN` naming the class, still `isTypedef` afterwards | both |
+| a `.ctl` moved into a folder | moved, `verified` - `Get All Descendents` with Type `VI` DOES list a `.ctl` member | both |
+| `itemsNotFoundByLabview` | NOT REACHED. The case it was written for - a `.ctl` member not listed under Type `VI` - does not occur (row above), and no other fixture made `Get All Descendents` miss a member the file lists. The refusal stays, unit-tested only | - |
+| `viHasUnsavedChanges`, `unsavedChangesBefore` by SCRIPT | not reachable: they read a VI's Front Panel and Block Diagram Mods Bitsets, and neither moved for a `VI Description` write nor for `Default Vals.Make Curr Default` - `VI Modifications Bitset Old` stayed 0 too. A VI changed only by another script's unsaved edit is not refused | - |
+| `unsavedChangesBefore` with a HAND edit (a panel object of a class member moved in the IDE, not saved) | **first attempt: NOT refused, and the class save wrote the user's edit to disk.** Every line of the listing answered `Error 1025`: the helper closed its application reference on a wire that did not wait for its loop, and the C# side dropped every line with an error code as "not modified". Fixed in both halves (below); then refused, naming the VI, nothing written | both, after the fix |
+| `viHasUnsavedChanges` with a HAND edit (a VI open with no project, panel object moved) | refused, nothing written, once the Front Panel bitset read `0x80001000` through both routes. **One earlier attempt was not refused** and wrote the VI; its bitsets at that moment were not read, and it did not recur | both |
+
+**What the port changed to get there**, each one found by this run rather than by reading:
+
+- **Two helper properties did not exist under the names the fork used.** `{LV.VI}`
+  `Modifications:VI Modifications Bitset` is in neither the catalogue nor the composer's table
+  (only `... Bitset Old` is), and `Path` on `{LV.VI}` is `VI Path`. Both are gone from
+  `lvai_set_vi_description.xml` and `lvai_save_modified_vis.xml`: the unsaved check reads the
+  Front Panel and Block Diagram Mods Bitsets - the two `lvai_af_modified_members.xml` reads, measured -
+  and the third field of a listing line is always 0. A wrong property name is the shape that has
+  killed LabVIEW in `ConvertAIXMLToVI` (CLAUDE.md), so they were not left to chance.
+- **`{LV.Library}` `Modifications Bit Set` was missing from the composer's table**, which refused
+  five of the seven helpers. Harvested from the NI-built helpers (`harvest_parts.py --props`):
+  code 1292953627 on `LV.Library` and `LV.LVClassLibrary`, plus `Description` on
+  `LV.LVClassLibrary` marked writable.
+- **The composer wired `ProjectItem.Move`'s `New Parent` net to `Insert After`.** Two parameters of
+  one type share ONE type descriptor, labelled after the first, and the composer's label map kept
+  the LAST row - "Invoke Node: Contains unwired or bad terminal", the move helpers broken while
+  every probe of the other four invoke nodes loaded executable. `aixml2vi.py` now keeps the first
+  row, the one NI's converter wires. Checked as an A/B over every helper document in `scripts\`
+  (`helper_coverage.py --skip-ni`): 99 composed, **97 executable before - the two move helpers
+  not - and 99 after**, nothing else changed. **A first attempt at that A/B measured nothing**:
+  the old composer was copied into `bin\`, and a server started from a checkout loads the
+  composer and its parts from the CHECKOUT (`AixmlComposer.Locate` walks up from the exe first),
+  so both arms ran the new code and agreed. To test a composer change, change the checkout's copy.
+- **Two constants of `lvai_add_to_class.xml` sat on the root diagram** and were read inside a case
+  frame; the composer refuses a net that crosses a diagram boundary without a tunnel. Moved into
+  the frame that reads them.
+- **The modified-VI listing closed its application reference before its loop ran.** The
+  `Close Reference` hung on the error wire from BEFORE the loop, so it could run first; every
+  `Open VI Reference` then answered 1025, and `lvai_add_to_class`'s unsaved check saw a clean
+  instance whatever the user had open. It waits for the loop now (a pass-through shift
+  register), and a listing line that could not be read REFUSES the call (`unsavedCheckFailed`) -
+  except a `.ctl` answering 1035, which is what `Open VI Reference` answers for every control.
+- **`lvai_add_to_class` never saved a caller.** It saved a listed caller only when its Front Panel
+  or Block Diagram bitset was set, and the relink LabVIEW makes when an item joins the class sets
+  neither - measured on both backends: `callersSaved: []`, the caller absent from `filesChanged`,
+  the new link on disk only because the project close saved it later. Every listed caller is
+  saved now (the before-check has already refused anything unsaved), and `verified` requires it
+  (`callersNotSaved`). Re-measured on fresh fixtures: `callersSaved` names the caller, its file is
+  in `filesChanged`, it runs (42) cold.
+- **`lvai_set_vi_descriptions` on pylabview wrote a DIFFERENT file of the same name.** The helper
+  runs over ActiveX in LabVIEW's main instance, where a `Caller.vi` and an `M1.vi` from another
+  fixture were loaded; `Open VI Reference` by path handed those back, and the call wrote and saved
+  THEM - its own check then reported the asked-for files unchanged. The helper reads the opened VI's
+  `VI Path` now and writes nothing on a mismatch (`viPathMismatch`, with `openedPath`); measured
+  live, the other file untouched. On grpc the helper runs in the AI addon's instance, where the
+  same call wrote the right file.
+- **The unsaved checks can be switched off: `checkUnsaved`** (default true) on all four tools -
+  the user's rule of 2026-10-17. The checks protect an EXISTING project where someone may have VIs
+  open with edits of their own; in a project this session builds itself there is nobody else's
+  work to protect, and a refusal only stops the build. Each helper gates its own verdict with a
+  `check unsaved` input, and `lvai_add_to_class` skips its listing (`listModifiedBefore` answers
+  `skipped`). Measured on both backends with a class left unsaved by a probe: `true` refused
+  `lvai_set_class_description`, `lvai_move_to_folder` and `lvai_add_to_class`; `false` let all three
+  write and save, verified from the files.
+- **The fork read the resource blocks through `ViIconLayers`**, part of its icon tools. That reader
+  is now `RsrcMap.Blocks`, beside the block-type reader this repository already had.

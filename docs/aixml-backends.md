@@ -1404,6 +1404,106 @@ memory.
 Together the two took the ATM project's 45 VIs from 228 s to 62 s in `lvai_layout_diagram`
 (`docs/diagram-layout.md` §4a).
 
+## Two parameters of one type, and the class housekeeping helpers (fixed 2026-10-17)
+
+Porting the class housekeeping tools (`lvai_set_class_description`, `lvai_move_to_folder`,
+`lvai_set_vi_descriptions`, `lvai_add_to_class`) onto this backend found one composer defect and
+three gaps, all closed; `docs/lvclass-creation.md` §10e has the acceptance on both backends.
+
+- **The composer wired an invoke parameter by its TYPE's label, and two parameters of one type
+  share one label.** LabVIEW folds identical types into one descriptor, labelled after the first
+  parameter: `ProjectItem.Move`'s `New Parent` and `Insert After` are both "New Parent". The label
+  map kept the LAST row, so the `New Parent` net went to `Insert After` and the helper loaded with
+  "Invoke Node: Contains unwired or bad terminal". Bisected with one probe per invoke node of the
+  helper - `LVClass.Open`, `Get All Descendents`, `AddItem` and `LVClassLibrary.Save` loaded
+  executable, `Move` alone did not - then compared with NI's build of the same probe, which flags
+  the FIRST invoke item as wired. The map keeps the first row now. A/B over every document in
+  `scripts\` (`helper_coverage.py --skip-ni`): of 99 composed, 97 executable before - the two
+  move helpers not - and 99 after, nothing else changed.
+- **Testing a composer change means changing the CHECKOUT's copy.** A server started from a
+  source checkout takes `aixml2vi.py` and `parts\` from the checkout's `scripts\aixml-pylabview`
+  (`AixmlComposer.Locate` walks up from the exe before it looks beside it), and the resident worker
+  reads that live copy. The first A/B of the fix above swapped the copy in `bin\` and so ran the
+  new composer in both arms - "98 before, 99 after", where the one difference was an unrelated
+  AIXML edit. (The two builds' `nodeName` differ too - NI's `Instr`, the composer's
+  `ProjectItem` - which is the 2026-10-14 finding above, not a fault.)
+- **`{LV.Library}` `Modifications Bit Set` was not in the table**; harvested from the NI-built
+  helpers with `harvest_parts.py --props` (code 1292953627, on `LV.Library` and
+  `LV.LVClassLibrary`). The ordinary second pass without `--props` brought nothing new: every key
+  already had a part, and the first sighting wins.
+- **Two helper property names did not exist** (`Modifications:VI Modifications Bitset`, `Path` on
+  `{LV.VI}`), and **a helper read two root constants inside a case frame**. Both fixed in the AIXML,
+  which NI's converter had accepted as it was.
+
+## A class INSIDE A LIBRARY - constants and dynamic calls (2026-10-17)
+
+Until 2026-10-17 the composer refused both, by name: a class constant of
+`Heater.lvlib:Heater.lvclass` ("inside a library - not composable yet") and a dynamic-dispatch call
+to one of its members ("only a class outside any library"). The AFDemo build hit the first through
+`lvai_generate_class_test`'s direct route. What LabVIEW writes was read off its own saves of two VIs
+holding such a constant and calling four accessors:
+
+| where | loose class | class in a library |
+|---|---|---|
+| constant value | `00000001 13 11 Rectangle.lvclass 00` + pad | `00000001 1D 0C Heater.lvlib 0E Heater.lvclass 00` + pad - one Pascal string per name |
+| `VIPI`/`FPPI`/`DDPI` name | `[Rectangle.lvclass, 07 00]` | `[Heater.lvlib, Heater.lvclass, 07 00]` |
+| `VIPI`/`DyOM` per method | `[Rectangle.lvclass, 01 n Method.vi]` | `[Heater.lvlib, Heater.lvclass, 01 n Method.vi]` |
+
+The value code was already general; the link records wrote only the FIRST name, and the method
+links took `qual[:1]` as the class. They now write the whole class name (`qual[:-1]` for a method),
+and a target written without its library (`Heater.lvclass:Read Setpoint.vi`) gets the library from
+the class file's own `NI.Lib.ContainingLib`. Measured: a VI with a Heater constant feeding
+`Read Setpoint.vi`, composed and run over ActiveX, answered `Setpoint = 20` (the class default) and
+`error out` clean, every record and the constant value byte-identical to LabVIEW's; the same VI on
+the loose `TemperatureSensor.lvclass` still answered `Gain = 1`. A class in a library nested in
+another library is not measured.
+
+## ActiveX reached the wrong LabVIEW on a mixed-bitness station - 2026-10-14
+
+**The symptom.** On a station with LabVIEW 2026 32-bit running and LabVIEW 2024 64-bit merely
+installed, `lvai_generate_vi` on `pylabview` composed a correct 26.3.1-stamped VI and the convert
+answered `openError: File version is later than the current LabVIEW version` - from a LabVIEW that
+was 26.3.1 itself. The call took 45 s, and LabVIEW 2026 was gone by its end (no crash log, no
+minidump; whether the two are connected was not settled).
+
+**The cause.** Every LabVIEW registers the same CLSID for `LabVIEW.Application`, once per bitness,
+and COM activates the registration matching the CLIENT. This server is 64-bit; the 64-bit
+registration named `LabVIEW 2024\LabVIEW.exe /Automation`. Measured with a probe: a 32-bit client
+attached to the running LabVIEW 2026 and started nothing, a 64-bit client STARTED LabVIEW 2024. So
+rule 1 of `LabViewCom` - never let COM start LabVIEW - was broken, silently, by the bitness of our
+own process; `NotReady()` had seen a running LabVIEW and passed.
+
+**The fix.** `LabViewCom.WithLabViewAsync` activates through `CoCreateInstance` with
+`CLSCTX_ACTIVATE_32_BIT_SERVER` or `_64_BIT_SERVER`, taken from the newest RUNNING LabVIEW (its
+release from the folder name, its bitness from `IsWow64Process`). And rule 1 is now checked rather
+than assumed: a LabVIEW process that appears during the activation is released at once and the call
+fails `errorKind: comStartedLabView`.
+
+**Merged into main on 2026-10-17 with main's own guard.** Main had meanwhile answered the same
+"COM started a second LabVIEW" case from the other direction - a hung running instance - in
+`LabViewCom.Attach`, which ends the started process and answers `labviewNotAnswering`. The merge
+keeps that guard and that answer, and takes the fork's bitness choice for the activation itself, so
+`comStartedLabView` does not occur. Only a single-bitness station was available for the merge, so
+the mixed-bitness case is the fork's measurement, not re-run here. What was re-run on 2026-10-17,
+with the same build: every pylabview call of the merge's acceptance attached to the running
+LabVIEW 2026 32-bit through the new activation, and three `lvai_exec_state` calls fired together
+all read the Error List (`errorsRead: true`) - where the same three, before the fork's process-wide
+ActiveX gate came in with the smoke-test fixes, had answered `Get Errors answered error 1026` on one.
+
+**Accepted the same day over raw stdio**, the built server, `backend: pylabview`, a six-terminal VI
+(`y = x * gain + offset`, error cluster passed through), with main's build as the control arm:
+
+| LabVIEW running | build | answer |
+|---|---|---|
+| 2026 32-bit | main (control) | LabVIEW 2024 64-bit started; `openError` 1125 |
+| 2026 32-bit | fix | `execState 1`, run `y = 8.5` for 3, 2.5, 1; nothing started |
+| **2020 32-bit**, alone | fix | written as a **20.0.1** file (`labviewInUse: 2020`), `ok: true`, `execState 1`, linker errors read, run `y = 8.5`, `error out` clean |
+
+**The first measurement on a LabVIEW older than 2025**: composed, opened, checked and run in
+LabVIEW 2020 f1 with no NI service involved. One step did not work there: Clean Up Diagram answered
+**LabVIEW error 2** at `Block Diagram:Clean Up` (Clean Up Panel worked); the step is reported and
+never gating, so the VI is left as composed. Not investigated further.
+
 ## Not covered, and not measured
 
 - **A DAQmx call has not been RUN through a composed VI** - the probes above stop at the link and

@@ -49,12 +49,14 @@ so an assistant gets the same text you do.
 | [`lvclass-interfaces.md`](lvclass-interfaces.md) | interfaces, multiple inheritance, and the link you can only set at creation time |
 | [`class-method-tooling.md`](class-method-tooling.md) | scripting a class method, and the four traps under it |
 | [`labview-actor-framework.md`](labview-actor-framework.md) | actors, messages, and why the library must exist first |
+| [`af-override-tools.md`](af-override-tools.md) | AF overrides by tool: create one, hook a body into it, take a hook out, re-run a hooked method |
 | [`dqmh-scripting.md`](dqmh-scripting.md) | driving Delacor's own scripting VIs over VI Server |
 | [`malleable-vis.md`](malleable-vis.md) | `.vim` files, and why AIXML alone writes a broken one |
 | [`labview-vit-templates.md`](labview-vit-templates.md) | starting from an NI `.vit`, event structures, dynamic events |
 | [`typedef-constants.md`](typedef-constants.md) and [`typedef-disconnect.md`](typedef-disconnect.md) | coercion dots, and the typedef whose loss nothing in the chain reports |
 | [`connector-pane-repair.md`](connector-pane-repair.md) | fixing a pane without regenerating, and the capability that got removed instead of shipped |
 | [`diagram-comments.md`](diagram-comments.md) | putting a comment where you meant it to go |
+| [`class-icons.md`](class-icons.md) | class and library icons, the template layer, and reading icons back without trusting a code 0 |
 | [`control-reference-binding.md`](control-reference-binding.md) | why a generated diagram cannot hold a bound control reference |
 | [`pylabview-controls.md`](pylabview-controls.md) and [`pylabview-comments.md`](pylabview-comments.md) | the no-LabVIEW route into `.ctl` files and labels |
 | [`bulk-operations.md`](bulk-operations.md) | one call instead of six |

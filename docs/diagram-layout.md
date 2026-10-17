@@ -442,3 +442,81 @@ The DQMH-Main skip stays in the automatic pipeline until the user lifts it. A di
 `lvai_layout_diagram` call does lay out a DQMH `Main.vi`.
 
 The front panel is still LabVIEW's own algorithm (`cleanUpPanel`).
+
+## 6. Independent chains as bands, 2026-10-17
+
+The symptom was a generated Caraya test, `Test Heater.vi` of an AF demo build. Its four cases
+share nothing but the error wire, yet the column layout put every case's nodes into common
+columns sorted by height, so every case's data wires crossed the others'.
+
+**The rule.** On the TOP-LEVEL diagram, the data graph without error edges is split into
+connected components. Where at least two of them have two or more nodes, the diagram is ALSO laid
+out in bands, and both plans are scored:
+
+- One band per component, stacked above the error rail. The component that met the rail furthest
+  left in the original is the top band.
+- Inside a band, each column's first node shares one top line, so a chain reads left to right.
+- A node of a band stays in its band rather than going onto the rail. Only the pure error chain
+  (`Merge Errors`, the test's `Define Test`) stays on the rail.
+
+**The choice.** The plan with fewer data-wire crossings wins, and a tie keeps the columns. The
+crossings are counted with orthogonal routing: out horizontally, a vertical 10 px after the
+source, then horizontally into the sink. Error wires and wires that share an end are not counted.
+Straight lines tied where the picture was plainly better.
+
+Both arms are needed. Applied unconditionally, bands made DQMH Main 50 px taller and took a small
+LayoutCheck VI from 1 crossing to 4. Inside a structure they broke the frame-note rule, so bands
+are top-level only.
+
+The user's review of the first render added three rules, all measured on the same fixtures:
+
+- **What collects the bands' errors comes after the last band column** (`CollectAfterBands`).
+  By longest path, the first `Merge Errors` took the column of the round-trip assertions, and
+  LabVIEW routed two error wires backwards round it.
+- **A constant never shares the column of what it feeds.** On the top level, the floor that gives
+  the controls their own column lifted `written 1` into its Write's column. There it was stacked
+  under the Write and its wire ran back up. What it feeds now moves one column on.
+- **In a band, a constant that feeds several nodes goes UNDER the chain.** Level with the chain,
+  its wire to the Assert ran at the chain's height, and `ClearCorridors` stepped the Read and the
+  Assert down out of its way, one staircase per band.
+
+| fixture | columns | bands |
+|---|---|---|
+| `test-heater3-generated.txt` (Test Heater.vi) | 5 crossings, 1104 px wide | **0**, 918 px |
+| `test-heater1-generated.txt` (accessor test) | 5 crossings, 1148 px | **0**, 853 px |
+| `test-sensor-generated.txt` (round trips) | 4 crossings, 1135 px | **0**, 903 px |
+| every other layout fixture (ATM, DQMH Main, LayoutCheck) | | plan unchanged, move for move |
+
+`LayoutBandTests` asserts both halves, plus no backward wire (`BackwardWires`, data and error) in a
+banded test. The column numbers moved from the first version of this section (8, 7, 5) because the
+constant rule changes the columns variant too.
+
+**Live, on the pylabview backend.** `lvai_layout_diagram` on the real `Test Heater.vi`:
+
+- 30 of 30 objects landed where planned;
+- `execState` stayed 1;
+- `Test Heater Methods.vi` was left unchanged;
+- the Caraya suite stayed 5 of 5 green.
+
+The render shows four straight bands: each class constant is left of its accessor, each `written`
+constant is below and left of its Write, and every error wire runs forward into the Merge Errors
+behind the last band.
+
+**The grpc twin's method test tied, and the tie kept the columns** (2026-10-17). Its two cases
+crossed nothing in the model either way, so the columns stayed, with both Reads stacked in one
+column. LabVIEW then drew the class wires across each other. On equal crossings the variant with the
+shorter vertical wire run now wins. That tie-break applies only where at least two bands are real
+chains fed by constants: three nodes or more besides constants, and no panel terminal.
+
+Without that restriction, two LayoutCheck helpers switched as well. One grew from 161 to 193 px
+high. On the other, send-block, the bands lifted two error-chain functions off the rail. Both
+helpers' chains start at panel terminals. The two grpc tests are fixtures now
+(`test-heater-methods-grpc.txt`, `test-heater-accessors-grpc.txt`), as LabVIEW left them after
+the generators.
+
+**Still open:**
+
+- LabVIEW routes `written 1` into the Assert's `Expected` from the right, round the `Label`
+  constant beside it.
+- The error wires still climb from the rail to each band's Assert.
+

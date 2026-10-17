@@ -149,6 +149,32 @@ authoring rule is: *name every constant you wire into a subVI call after the ter
 
 A constant created by hand in the IDE usually has no label at all, and cannot be found this way.
 
+## 5a. A class INSIDE a cluster - the caller's cluster after the swap (2026-10-11, not yet measured)
+
+`lvai_placeholder_subvi` writes a class that is a cluster ELEMENT as a `path` element of the same
+cluster - `cluster{ref{UDClassInst}.hardware,uint32.intervalMs}` becomes
+`cluster{path.hardware,uint32.intervalMs}`, through nested clusters and arrays of clusters - and
+lists each under `classElementsInClusters` as `{terminal, element}` (`inner.hw`, `devices[].hw`).
+Until that day the whole terminal became a scalar `path`, because the class test looked for
+`UDClassInst` anywhere in the type string, so a caller authored against the socket had no cluster to
+wire. A class inside a refnum payload, or an array of classes outside any cluster, still collapses
+the whole terminal as before.
+
+The swap re-types the wires; it does NOT re-type the CALLER's own cluster source, which still
+carries the `path` element where the real subVI wants the class - the same leak §1 describes for a
+typedef, one level down. Two follow-ups, by where the cluster comes from:
+
+| caller's source | follow-up |
+|---|---|
+| a front-panel control | `lvai_bind_pane_typedef` - the constant-label route of §5 cannot reach a control |
+| a cluster constant | `lvai_swap_subvis` with `constantsJson` `[{"label":"<constant label>","class":"<path to the typedef .ctl>"}]` |
+
+The second row is `{LV.Constant}` `Replace` pointed at a `.ctl` rather than a `.lvclass`, which turns
+a bare cluster constant into an instance of that typedef. **It was observed in a field run and is
+not measured in this repository** - in particular it is not established what happens to the
+constant's value, or to a cluster the `.ctl` does not match. Check the result with
+`lvai_coercion_dots` and `lvai_exec_state` rather than trusting `constantsSwapped`.
+
 ## 6. Where the check belongs
 
 In `pylv_apply`'s **verify** step, not in `lvai_generate_vi`. At generation time the call still
@@ -265,3 +291,28 @@ iteration". The two designs that respect it:
 Either way `nodeIndex` stops being unique — an index into `All Objects[]` is per diagram — so the
 address becomes compound or a flat ordinal over a traversal both passes must walk identically.
 That contract, not the descent, is the bulk of the work.
+
+## The sweep read NOTHING while a project held the VI (2026-10-13)
+
+**Symptom.** With the caller's project open, `lvai_coercion_dots` answered `subViCalls: 0` on a
+caller that has one call, and so did both sweeps inside `lvai_bind_typedef_constants` - which
+NEEDS the project. Its name resolution then had nothing to resolve against (a misspelt
+`subViName` was not refused but passed on as given), and its verify step said it could not run
+while the bind had worked. Measured on one caller: with no project, three sweeps in a row read the
+call; with the project open, one did and two read nothing.
+
+**Two causes, one after the other.** The helper opened the VI with no application reference - a
+SECOND copy in the helper's own instance - while the IDE held the real one in the project's. It now
+opens the VI in `Project:Active Project` -> `Application` when a project is active (the route
+`lvbd_bind_constant.xml` always took) and in its own instance only when none is, which keeps the
+`pylv_apply` case, project closed, working. That made reads correct but not reliable: eight sweeps
+read `1 0 0 1 0 1 0 1` calls, every failure EMPTY and never wrong, and with the caller held open in
+the IDE the same eight read 1 each time. The VI is loaded and unloaded on each helper run and a run
+that catches it in between reads nothing - the "first open reads empty" trap CLAUDE.md records. So
+an empty run is retried, up to three tries (`TypedefTools.SweepAttempts`), and
+`lvai_coercion_dots` reports `retriedRuns`. Measured after both: sixteen sweeps with the project
+open all correct, at most one retry each; `Gibtsnicht.vi` refused as `subViNotOnDiagram`; the bind
+`ok: true` with `coercedBefore: 1`, `coercedAfter: 0`.
+
+`lvai_exec_state` opens its VI without an application reference too, and has not been measured
+against this.

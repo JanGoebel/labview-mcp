@@ -74,13 +74,17 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
         THE ACTOR MUST DESCEND FROM Actor.lvclass - checked by walking the class file's own parent
         links, which is also how the LabVIEW installation is located, so the template and the
         message parent always come from the same install as the actor.
+        PUT THE ACTOR IN ITS LIBRARY FIRST. An actor added to a .lvlib after its messages exist
+        leaves every Do.vi eBad (measured 2026-09-18) with every file-level check green; the
+        repair is rebuilding the messages. Order: class, methods, library, messages.
         """)]
     public async Task<string> CreateMessageClassAsync(
         [Description(@"Absolute path to the actor's .lvclass - it must descend from Actor.lvclass")]
         string actorClassPath,
         [Description("""
             The actor method the message should call, e.g. "Increment" or "Increment.vi". It must
-            be a PUBLIC member of the actor class and live beside it on disk. Its non-class,
+            be a PUBLIC member of the actor class (refused as `methodNotPublic` otherwise,
+            before anything is written) and live beside it on disk. Its non-class,
             non-error inputs become the message's payload, one private data field each.
             """)]
         string actorMethodName,
@@ -90,9 +94,12 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
             """)]
         string? className = null,
         [Description("""
-            Folder to create the message class in. Defaults to a folder named after the class
-            BESIDE the actor's own folder, which is where NI's wizard puts it. The class lands
-            directly in this folder, not in a subfolder of it.
+            Folder to create the message class in. Defaults to `<method> Msg` in the folder that
+            holds the actor's own folder, i.e. a sibling of it. The class lands directly in this
+            folder, not in a subfolder of it, so give EVERY message its own folder: two message
+            classes in one folder answer Error 1055 at replaceActorMethod. A layout that keeps an
+            actor's messages together is `<actor folder>\..\<Actor> Messages\<Method> Msg`, which
+            earlier builds passed explicitly and the AF guide describes as NI's wizard's own.
             """)]
         string? directory = null,
         [Description("""
@@ -140,8 +147,9 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
             var methodPath = Path.Combine(actorFolder, methodFile);
 
             var actorInfo = LvClass.Read(actorFull);
-            if (!actorInfo.Members.Any(m =>
-                    string.Equals(m.Name, methodFile, StringComparison.OrdinalIgnoreCase)))
+            var member = actorInfo.Members.FirstOrDefault(m =>
+                string.Equals(m.Name, methodFile, StringComparison.OrdinalIgnoreCase));
+            if (member is null)
                 return Json.Error("notAClassMember",
                     $"'{methodFile}' is not a member of '{actorInfo.ClassName}'. A message is " +
                     "built from the actor's own public method, so the method has to be one.",
@@ -151,6 +159,20 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
                         ["members"] = new JsonArray(
                             [.. actorInfo.Members.Select(m => (JsonNode)m.Name!)]),
                     });
+
+            // THE MESSAGE IS NOT IN THE ACTOR'S SCOPE. Its Do.vi is a member of the MESSAGE class,
+            // which neither descends from the actor nor exists yet to be named a friend, so a
+            // protected, private or community method is one Do.vi cannot call - and Copy Class.vi
+            // has already written the half-built class by the time that shows. The description
+            // always said "a PUBLIC member"; this is the check it promised. Reasoned from the
+            // scope rules, not measured on a run.
+            if (!IsPublicScope(member.Scope))
+                return Json.Error("methodNotPublic",
+                    $"'{methodFile}' is {member.Scope} in '{actorInfo.ClassName}'. A message's " +
+                    "Do.vi lives in the message class, outside the actor's scope, so it can only " +
+                    "call a PUBLIC method. Make the method public, or give the actor a public " +
+                    "method that calls it, and build the message for that one.",
+                    new { methodPath, scope = member.Scope });
 
             if (!File.Exists(methodPath))
                 return Json.Error("methodFileMissing",
@@ -310,12 +332,49 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
                 verify["source"] = "the saved .lvclass, read with pylabview - no LabVIEW involved";
             }
 
+            // NO COMPILED CODE IN A WRITTEN VI. Message Maker's Build Do.vi saves Do.vi from the
+            // project's instance, where it was just compiled - measured 2026-10-17 in the AFDemo2
+            // build: Do.vi carried a VICD block, Send <Method>.vi from the same call did not. Both
+            // are checked off their own resource map; one that carries VICD is stripped through
+            // pylabview with the project CLOSED (an edit under a loaded VI is served stale), and
+            // the file is checked again.
+            var sendPath = Scalar(values, "new send method");
+            var doPath = Path.Combine(destination, "Do.vi");
+            JsonObject? compiled = null;
+            if (verified)
+            {
+                var carrying = new[] { doPath, sendPath }
+                    .Where(p => p is { Length: > 0 } && BulkTools.ContainsCompiledCode(p!))
+                    .Select(p => p!).ToList();
+                compiled = new JsonObject { ["found"] = new JsonArray([.. carrying.Select(p => (JsonNode)p)]) };
+                if (carrying.Count > 0)
+                {
+                    var closed = await new CloseTools(connection).CloseActiveProjectAsync(
+                        projectPath: projectPath is { Length: > 0 } ? Path.GetFullPath(projectPath) : null,
+                        timeoutSeconds: timeoutSeconds, ct: ct, backend: BackendRoute.Current);
+                    steps.Add(new JsonObject { ["step"] = "closeProjectForStrip", ["answer"] = Read(closed) });
+                    var stripped = new JsonArray();
+                    var left = new JsonArray();
+                    foreach (var vi in carrying)
+                    {
+                        var strip = await new DiagramCleanup(connection).StripCompiledAsync(vi, timeoutSeconds, ct);
+                        steps.Add(new JsonObject { ["step"] = "stripCompiled", ["vi"] = vi, ["answer"] = strip });
+                        (BulkTools.ContainsCompiledCode(vi) ? left : stripped).Add(vi);
+                    }
+                    compiled["stripped"] = stripped;
+                    compiled["stillCompiled"] = left;
+                    compiled["projectLeftOpen"] = false;
+                    verified = left.Count == 0;
+                }
+            }
+
             return Json.Document(new JsonObject
             {
                 ["ok"] = verified,
+                ["compiledCode"] = compiled,
                 ["classPath"] = newClassPath,
-                ["sendMethodPath"] = Scalar(values, "new send method"),
-                ["doMethodPath"] = Path.Combine(destination, "Do.vi"),
+                ["sendMethodPath"] = sendPath,
+                ["doMethodPath"] = doPath,
                 ["payloadControlCount"] = Scalar(values, "payload control count"),
                 ["actorClassPath"] = actorFull,
                 ["actorMethodPath"] = methodPath,
@@ -351,11 +410,18 @@ internal sealed class ActorFrameworkTools(LvaiConnection connection)
     ];
 
     /// <summary>
+    /// True for a member <see cref="LvClass"/> reads as public - with or without a recorded
+    /// scope, because LabVIEW writes no scope property at all for many public members.
+    /// </summary>
+    internal static bool IsPublicScope(string scope) =>
+        scope.StartsWith("public", StringComparison.Ordinal);
+
+    /// <summary>
     /// The LabVIEW installation the actor's own ancestry lands in, by walking parent links up to
     /// <c>Actor.lvclass</c>. Null when the chain never reaches it - which is the same thing as
     /// "this is not an actor", so the caller gets one answer for two questions.
     /// </summary>
-    private static string? ActorInstallationRoot(string lvclassPath)
+    internal static string? ActorInstallationRoot(string lvclassPath)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var current = lvclassPath;

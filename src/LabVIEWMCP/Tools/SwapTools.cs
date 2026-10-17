@@ -53,6 +53,18 @@ internal sealed class SwapTools(LvaiConnection connection)
         NODES ARE SWAPPED FIRST AND CONSTANTS LAST, always. A dynamic dispatch input is a REQUIRED
         terminal, so a class chain needs a class value; with the nodes already swapped that wire has
         a class sink and Replace re-types it, where the other order breaks it.
+        A CONSTANT IS FOUND AT ANY DEPTH since 2026-10-11 - inside a loop or a Case frame too. It
+        was read off the top-level diagram's All Objects[], which does not descend, so a seed
+        constant in a structure was never found. A LABEL THAT MORE THAN ONE CONSTANT CARRIES IS
+        REFUSED: it is not replaced, `constantsAmbiguous` names it with its match count, `ok` is
+        false (`errorKind: constantLabelAmbiguous`), and every other label is still replaced and
+        the VI saved - matching is by label, so two constants with one label cannot say which one
+        is meant. A label no constant carries is `constantsNotOnDiagram`. `constantMatches` gives
+        every label's count; `constantsSeen` is how many constants the traversal returned, and
+        zero there means the helper's class name matched nothing. Measured 2026-10-17 on both
+        backends: `Constant` matched all five constants of a probe (path, bool), a path seed
+        inside a Case frame inside a While Loop became a class constant, and a label two
+        constants carried was refused with both left as they were.
         A CALL INSIDE A LOOP OR A CASE FRAME IS REACHED, and that is new as of 2026-09-16. The
         helper collected from {LV.Diagram} SubVIs[], which lists the diagram it is asked about and
         does NOT descend into structures, so a nested call came back under `socketsNotOnDiagram`
@@ -103,6 +115,10 @@ internal sealed class SwapTools(LvaiConnection connection)
         Error 1055 - and that error would travel down the wire and stop the save. `verify` therefore
         re-exports the VI through LabVIEW afterwards and reports its call targets; that export is the
         only real proof, and `socketsLeft` above zero means a swap did not land.
+        THE LAST STEP CLEARS BROKEN WIRES (`removeBadWires`, default true, since 2026-10-11): a
+        Replace that cannot re-type a wire leaves it broken and the VI at state 0. It runs before
+        the verify export, lists every removed wire under `badWireCleanup`, and a sink that lost its
+        wire from a source makes `ok` false (`errorKind: badWireCleanupLostConnection`).
         """)]
     public async Task<string> SwapSubVisAsync(
         [Description("""
@@ -171,13 +187,22 @@ internal sealed class SwapTools(LvaiConnection connection)
             node's position while its size and terminals change. Reported, never gating; a DQMH
             module's Main.vi is never touched.
             """)]
-        bool cleanUpDiagram = true)
+        bool cleanUpDiagram = true,
+        [Description("""
+            After a saved swap, clear the BROKEN wires left on the diagram (BD.Remove Bad Wires, in
+            the IDE's instance) and report each removed wire under `badWireCleanup`. Default true -
+            the user's rule of 2026-10-11. A sink that had a wire from a source before and none
+            after is a LOST CONNECTION: it is named in `inputsLeftUnwired` and `ok` is false
+            (`errorKind: badWireCleanupLostConnection`). A VI with no broken wire is not touched.
+            Runs before the layout, so the layout sees the cleaned diagram.
+            """)]
+        bool removeBadWires = true)
     {
         if (!AixmlBackend.TryResolve(backend, "lvai_swap_subvis", out _, out var badBackend))
             return AixmlBackend.Refusal(badBackend);
         if (editsJson is { Length: > 0 })
             return await ManyAsync(editsJson, verify, verbose, helperViPath, helperAixmlPath,
-                                   regenerateHelper, timeoutSeconds, cleanUpDiagram, ct: ct);
+                                   regenerateHelper, timeoutSeconds, cleanUpDiagram, removeBadWires, ct: ct);
 
         // Now that `viPath` is optional in the schema, its absence has to be caught here - and
         // named, rather than arriving as a null-reference somewhere further down.
@@ -188,21 +213,23 @@ internal sealed class SwapTools(LvaiConnection connection)
 
         return await OneAndCleanAsync(viPath, swapsJson, constantsJson, verify, verbose, helperViPath,
                                       helperAixmlPath, regenerateHelper, timeoutSeconds,
-                                      cleanUpDiagram, ct: ct);
+                                      cleanUpDiagram, removeBadWires, ct: ct);
     }
 
     /// <summary>
-    /// One swap, then our layout of the saved VI when the swap was ok. The clean-up is added to the
-    /// answer as `cleanUpDiagram` and never changes its `ok`.
+    /// One swap - which ends with Remove Bad Wires when asked - then our layout of the saved VI
+    /// when the swap was ok. The clean-up is added to the answer as `cleanUpDiagram` and never
+    /// changes its `ok`.
     /// </summary>
     private async Task<string> OneAndCleanAsync(string viPath, string? swapsJson, string? constantsJson,
                                                 bool verify, bool verbose, string? helperViPath,
                                                 string? helperAixmlPath, bool regenerateHelper,
                                                 int timeoutSeconds, bool cleanUpDiagram,
-                                                CancellationToken ct)
+                                                bool removeBadWires, CancellationToken ct)
     {
         var answer = await OneAsync(viPath, swapsJson, constantsJson, verify, verbose, helperViPath,
-                                    helperAixmlPath, regenerateHelper, timeoutSeconds, ct: ct);
+                                    helperAixmlPath, regenerateHelper, timeoutSeconds, removeBadWires,
+                                    ct: ct);
         if (!cleanUpDiagram || Read(answer) is not JsonObject node
             || node["ok"]?.GetValue<bool>() is not true)
             return answer;
@@ -222,7 +249,7 @@ internal sealed class SwapTools(LvaiConnection connection)
     private async Task<string> ManyAsync(string editsJson, bool verify, bool verbose,
                                          string? helperViPath, string? helperAixmlPath,
                                          bool regenerateHelper, int timeoutSeconds,
-                                         bool cleanUpDiagram, CancellationToken ct)
+                                         bool cleanUpDiagram, bool removeBadWires, CancellationToken ct)
     {
         JsonNode? parsed;
         try { parsed = JsonNode.Parse(editsJson); }
@@ -262,7 +289,7 @@ internal sealed class SwapTools(LvaiConnection connection)
         {
             var one = await OneAndCleanAsync(edit.Vi, edit.Swaps, edit.Constants, verify, verbose,
                                              helperViPath, helperAixmlPath, regenerateHelper,
-                                             timeoutSeconds, cleanUpDiagram, ct: ct);
+                                             timeoutSeconds, cleanUpDiagram, removeBadWires, ct: ct);
             var node = Read(one);
             answers.Add(new JsonObject { ["vi"] = edit.Vi, ["answer"] = node });
 
@@ -299,7 +326,8 @@ internal sealed class SwapTools(LvaiConnection connection)
     private async Task<string> OneAsync(string viPath, string? swapsJson, string? constantsJson,
                                         bool verify, bool verbose, string? helperViPath,
                                         string? helperAixmlPath, bool regenerateHelper,
-                                        int timeoutSeconds, CancellationToken ct) =>
+                                        int timeoutSeconds, bool removeBadWires,
+                                        CancellationToken ct) =>
         await Rpc.GuardAsync(async () =>
         {
             if (!File.Exists(viPath))
@@ -351,8 +379,11 @@ internal sealed class SwapTools(LvaiConnection connection)
             if (Path.GetDirectoryName(helperVi) is { Length: > 0 } directory)
                 Directory.CreateDirectory(directory);
 
+            // NOT `!File.Exists` - see Infra/HelperCache. The helper gained `constant matches`
+            // and `constants seen` on 2026-10-11; a VI cached before that has neither control, and
+            // a missing output is not an error anywhere - the per-label verdict would read empty.
             var helperGenerated = false;
-            if (regenerateHelper || !File.Exists(helperVi))
+            if (regenerateHelper || HelperCache.NeedsRebuild(aixml, helperVi))
             {
                 var built = await new BulkTools(connection).GenerateViAsync(
                     aixml, helperVi, openVI: false, measurePane: false, panePattern: null,
@@ -443,6 +474,25 @@ internal sealed class SwapTools(LvaiConnection connection)
             // helper actually FOUND. `nodesAsked` keeps the request visible beside it.
             var nodesSwapped = NodesThatLanded(swapped, present, swaps.Select(s => s.Socket));
 
+            // PER LABEL, NOT PER REQUEST. The helper counts how many diagram constants carry each
+            // requested label - at ANY depth since 2026-10-11, where it used to see the top-level
+            // diagram only - and replaces only a label with exactly one match. A label on two
+            // constants cannot say which one is meant, so it is REFUSED rather than guessed: the
+            // user's decision of 2026-10-11.
+            var constantOutcome = ConstantOutcome.From(
+                constants, Counts(values, "constant matches"), swapped,
+                int.TryParse(Scalar(values, "constants seen"), out var seen) ? seen : null);
+
+            // THE BROKEN-WIRE CLEANUP RUNS BEFORE THE VERIFY EXPORT, so `callTargets` and the
+            // wiring comparison describe the diagram as it is left - not one that still carries
+            // the wires the cleanup removed. Only after a SAVED swap: an errored helper wrote
+            // nothing, so there is nothing of this call's to clean.
+            var cleanup = !removeBadWires
+                ? BadWireCleanup.Skipped("removeBadWires was false.")
+                : !swapped
+                    ? BadWireCleanup.Skipped("The swap did not save the VI, so this call left nothing to clean.")
+                    : await new BadWireCleanup(connection).RunAsync(viPath, timeoutSeconds, ct);
+
             JsonNode? targets = null;
             // What the diagram calls AFTER the swap, with repetition, read off the verify export.
             // `present` is the helper's listing from BEFORE its Replace, and it used to be the
@@ -517,8 +567,9 @@ internal sealed class SwapTools(LvaiConnection connection)
             // step, so two agents had to list their test VIs in the .lvproj by hand - about 135 s
             // of wall clock each. `wiringLost` stays in the answer because reading it against the
             // export is occasionally useful, but nothing may branch on it.
-            var ok = swapped && missing.Count == 0 && socketsLeft <= 0;
-            return Json.Document(new JsonObject
+            var ok = swapped && missing.Count == 0 && socketsLeft <= 0
+                     && constantOutcome.Ambiguous.Count == 0 && constantOutcome.Missing.Count == 0;
+            var result = new JsonObject
             {
                 ["ok"] = ok,
                 ["viPath"] = Path.GetFullPath(viPath),
@@ -526,7 +577,13 @@ internal sealed class SwapTools(LvaiConnection connection)
                 ["wiringLost"] = wiringLost,
                 ["nodesSwapped"] = nodesSwapped,
                 ["nodesAsked"] = swaps.Count,
-                ["constantsSwapped"] = swapped ? constants.Count : 0,
+                ["constantsSwapped"] = constantOutcome.Swapped,
+                ["constantsAsked"] = constants.Count,
+                ["constantMatches"] = constantOutcome.MatchesJson(),
+                ["constantsAmbiguous"] = constantOutcome.AmbiguousJson(),
+                ["constantsNotOnDiagram"] = constantOutcome.Missing.Count == 0
+                    ? null : new JsonArray([.. constantOutcome.Missing.Select(m => (JsonNode)m!)]),
+                ["constantsSeen"] = constantOutcome.Seen,
                 ["socketsLeft"] = socketsLeft < 0 ? null : socketsLeft,
                 ["socketsNotOnDiagram"] = missing.Count == 0
                     ? null : new JsonArray([.. missing.Select(m => (JsonNode)m!)]),
@@ -553,11 +610,16 @@ internal sealed class SwapTools(LvaiConnection connection)
                 // outside the IDE's own application instance. The answer used to report the bare
                 // code beside `Invoke Node in lvai_swap_subvis.vi`, which names the node rather
                 // than the cause and reads like an internal fault.
-                ["errorKind"] = code == "1055" ? "noActiveProject" : null,
+                ["errorKind"] = code == "1055" ? "noActiveProject"
+                    : constantOutcome.Ambiguous.Count > 0 ? "constantLabelAmbiguous"
+                    : constantOutcome.Missing.Count > 0 ? "constantLabelNotOnDiagram" : null,
                 ["steps"] = steps,
                 ["totalElapsedMs"] = total.ElapsedMilliseconds,
-                ["note"] = Note(ok, swapped, missing, socketsLeft, verify, code, after ?? present),
-            });
+                ["note"] = Note(ok, swapped, missing, socketsLeft, verify, code, after ?? present,
+                                constantOutcome),
+            };
+            BadWireCleanup.Attach(result, cleanup);
+            return Json.Document(result);
         });
 
     /// <summary>
@@ -577,7 +639,8 @@ internal sealed class SwapTools(LvaiConnection connection)
     }
 
     internal static string Note(bool ok, bool swapped, List<string> missing, int socketsLeft,
-                               bool verify, string? code, List<string> present)
+                               bool verify, string? code, List<string> present,
+                               ConstantOutcome? constants = null)
     {
         // WHICH NAMES ARE AVAILABLE, appended wherever a name did not match. The old text said
         // "take names from `node names found`" and that field is inside the swap step's slimmed
@@ -605,6 +668,10 @@ internal sealed class SwapTools(LvaiConnection connection)
                    "ALREADY POINTED AT A CLASS MEMBER CARRIES ITS QUALIFIED NAME - " +
                    "`Centrifugal Pump.lvclass:Read Last Event.vi`, not `Read Last Event.vi` - " +
                    "which is what a second swap over the same diagram has to use." + onDiagram;
+        // A REFUSED OR MISSING LABEL IS NAMED BEFORE THE SOCKET COUNT, because it is the one
+        // failure here the caller fixes in its own AIXML: distinct `_name`s, then regenerate.
+        if (constants is { } c && (c.Ambiguous.Count > 0 || c.Missing.Count > 0))
+            return ConstantNote(c);
         if (socketsLeft > 0)
             return $"{socketsLeft} socket name(s) are STILL in {AixmlBackend.ExportName()} of the VI, so " +
                    "that many ENTRIES did not land. IT IS NOT A NODE COUNT: it counts swapsJson " +
@@ -623,7 +690,67 @@ internal sealed class SwapTools(LvaiConnection connection)
               "cannot be read back from the object it replaced. Export the VI and read target=.";
     }
 
-    /// <summary>Every <c>target="…"</c> in an AIXML export, which is what the diagram now calls.</summary>
+    /// <summary>The note for a constant label that was refused or not found.</summary>
+    internal static string ConstantNote(ConstantOutcome constants)
+    {
+        var parts = new List<string>();
+        if (constants.Ambiguous.Count > 0)
+            parts.Add("REFUSED, NOT REPLACED: " + string.Join(", ",
+                          constants.Ambiguous.Select(a => $"'{a.Label}' ({a.Matches} constants)")) +
+                      ". A constant is matched by its block diagram label, so a label several " +
+                      "constants carry cannot say which one is meant - guessing would put the class " +
+                      "into the wrong wire with no error. Give each constant its own `_name` in the " +
+                      "AIXML, regenerate, and swap again. Every other label in this call that matched " +
+                      "exactly one constant WAS replaced, and the VI was saved.");
+        if (constants.Missing.Count > 0)
+            parts.Add("NOT ON THE DIAGRAM: " + string.Join(", ", constants.Missing.Select(m => $"'{m}'")) +
+                      " - no constant at any depth carries that label." +
+                      (constants.Seen == 0
+                          ? " THE TRAVERSAL RETURNED NO CONSTANT AT ALL (`constantsSeen: 0`), which " +
+                            "points at the helper's `Constant Class Name` rather than at the label: " +
+                            "whether a diagram constant answers to the class name `Constant` is not " +
+                            "measured yet."
+                          : " AIXML's `_name` on a Constant is what becomes its label."));
+        return string.Join(" ", parts);
+    }
+
+    /// <summary>
+    /// What became of each requested constant label. The helper's per-label count arrives in
+    /// request order; a reply WITHOUT it is an older helper, and then the request stands in for
+    /// the outcome - the same fallback <see cref="NodesThatLanded"/> makes.
+    /// </summary>
+    internal sealed record ConstantOutcome(
+        int Swapped, IReadOnlyList<(string Label, int Matches)> PerLabel,
+        IReadOnlyList<(string Label, int Matches)> Ambiguous, IReadOnlyList<string> Missing, int? Seen)
+    {
+        internal static ConstantOutcome From(IReadOnlyList<ConstantSwap> constants,
+                                             IReadOnlyList<int> matches, bool swapped,
+                                             int? seen = null)
+        {
+            if (constants.Count == 0) return new(0, [], [], [], seen);
+            // An EMPTY LabVIEW array still flattens one template element with an empty <Val>,
+            // which parses as -1 here - so a count that is not a count is no answer either.
+            if (matches.Count != constants.Count || matches.Any(m => m < 0))
+                return new(swapped ? constants.Count : 0, [], [], [], seen);
+
+            var perLabel = constants.Select((c, i) => (c.Label, matches[i])).ToList();
+            var ambiguous = perLabel.Where(p => p.Item2 > 1).ToList();
+            var missing = perLabel.Where(p => p.Item2 == 0).Select(p => p.Label).ToList();
+            // AN ERRORED HELPER SAVED NOTHING, whatever it counted - the error on the wire stops
+            // Save.Instrument, exactly as for the nodes.
+            var landed = swapped ? perLabel.Count(p => p.Item2 == 1) : 0;
+            return new(landed, perLabel, ambiguous, missing, seen);
+        }
+
+        internal JsonArray? MatchesJson() => PerLabel.Count == 0 ? null : Rows(PerLabel);
+
+        internal JsonArray? AmbiguousJson() => Ambiguous.Count == 0 ? null : Rows(Ambiguous);
+
+        private static JsonArray Rows(IEnumerable<(string Label, int Matches)> rows) =>
+            new([.. rows.Select(p => (JsonNode)new JsonObject
+                { ["label"] = p.Label, ["matches"] = p.Matches })]);
+    }
+
     /// <summary>What one `Call` node had wired, keyed so it survives a retarget.</summary>
     internal sealed record NodeWiring(string Target, List<string> WiredInputs,
                                       List<string> WiredOutputs)
@@ -785,6 +912,10 @@ internal sealed class SwapTools(LvaiConnection connection)
         o[key]?.GetValue<string>() is { Length: > 0 } value
             ? value
             : throw new ArgumentException($"{argument}[{index}] has no \"{key}\".");
+
+    /// <summary>An int32 array the helper returned as flattened XML; empty when it is absent.</summary>
+    internal static List<int> Counts(JsonObject? values, string name) =>
+        [.. Names(values, name).Select(v => int.TryParse(v, out var n) ? n : -1)];
 
     private static string? Scalar(JsonObject? values, string name) =>
         (values?[name] as JsonObject)?["value"]?.GetValue<string>();

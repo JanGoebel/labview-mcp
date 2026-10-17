@@ -1305,11 +1305,15 @@ internal sealed class ClassTools(LvaiConnection connection)
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
         // An EMPTY project, not one listing the class: LabVIEW opens a modal search dialog for a
         // project item whose file is not there yet, and a modal dialog stops the gRPC service.
-        if (!File.Exists(full)) File.WriteAllText(full, LvClass.Project([], lvVersion));
+        if (!File.Exists(full)) LvTextFile.WriteNew(full, LvClass.Project([], lvVersion));
 
         // The parent is listed for the READER's benefit - a hierarchy the project does not show is
-        // confusing - not because anything in the run needs it there.
-        if (parentClassPath is { Length: > 0 } && File.Exists(parentClassPath))
+        // confusing - not because anything in the run needs it there. NOT a parent from the
+        // LabVIEW installation: Actor.lvclass came out at target level with a URL running into
+        // Program Files (a grpc build of 2026-10-17), where LabVIEW itself keeps it under
+        // Dependencies and drops the entry on its next save.
+        if (parentClassPath is { Length: > 0 } && File.Exists(parentClassPath)
+            && !InLabViewInstallation(parentClassPath))
         {
             try
             {
@@ -1325,6 +1329,16 @@ internal sealed class ClassTools(LvaiConnection connection)
         return full;
     }
 
+    /// <summary>A file under a LabVIEW installation - some folder above it holds LabVIEW.exe:
+    /// vi.lib, user.lib, instr.lib, LVAddons, resource.</summary>
+    internal static bool InLabViewInstallation(string path)
+    {
+        for (var dir = Path.GetDirectoryName(Path.GetFullPath(path)); dir is { Length: > 0 };
+             dir = Path.GetDirectoryName(dir))
+            if (File.Exists(Path.Combine(dir, "LabVIEW.exe"))) return true;
+        return false;
+    }
+
     private static (string Path, bool Scratch, JsonObject Step) PrepareProject(
         string? projectPath, string classPath, string className, string work,
         string? parentClassPath, string lvVersion)
@@ -1332,7 +1346,7 @@ internal sealed class ClassTools(LvaiConnection connection)
         if (projectPath is not { Length: > 0 })
         {
             var scratchPath = Path.Combine(work, $"{className}-loadcheck.lvproj");
-            File.WriteAllText(scratchPath, LvClass.Project(ParentEntry(scratchPath), lvVersion));
+            LvTextFile.WriteNew(scratchPath, LvClass.Project(ParentEntry(scratchPath), lvVersion));
             return (scratchPath, true, new JsonObject
             {
                 ["step"] = "project",
@@ -1350,7 +1364,7 @@ internal sealed class ClassTools(LvaiConnection connection)
 
         if (!File.Exists(full))
         {
-            File.WriteAllText(full, LvClass.Project(ParentEntry(full), lvVersion));
+            LvTextFile.WriteNew(full, LvClass.Project(ParentEntry(full), lvVersion));
             return (full, false, new JsonObject
             {
                 ["step"] = "project",
@@ -1527,9 +1541,9 @@ internal sealed class ClassTools(LvaiConnection connection)
             // helper and carrier end up listed in the user's project. Measured on the first live
             // run of this route: three stray VIs, one of them from an earlier session. They are
             // stripped here rather than left for the reader to notice.
-            var (tidied, removed, strayNames) = StripHelperItems(
-                File.ReadAllText(projectPath), projectPath);
-            if (removed > 0) File.WriteAllText(projectPath, tidied);
+            var (projectText, projectStyle) = LvTextFile.Read(projectPath);
+            var (tidied, removed, strayNames) = StripHelperItems(projectText, projectPath);
+            if (removed > 0) LvTextFile.Write(projectPath, tidied, projectStyle);
 
             return new JsonObject
             {
@@ -2077,7 +2091,14 @@ internal sealed class ClassTools(LvaiConnection connection)
             wizard is the same VI either way. helperViPath is ignored there - composed helpers live
             in their own folder. LabVIEW must already be running.
             """)]
-        string? backend = null)
+        string? backend = null,
+        [Description("""
+            Draw an icon on every accessor this call creates - the class's first word as the
+            banner, READ or WRITE and the field under it - as the last step of each slice. Default
+            true; a class that has its OWN icon keeps the template the wizard laid on and is not
+            touched. Reported per VI under `icons`, never gating.
+            """)]
+        bool setIcons = true)
     {
         if (!AixmlBackend.TryResolve(backend, "lvai_create_accessors", out var choice, out var badBackend))
             return AixmlBackend.Refusal(badBackend);
@@ -2357,6 +2378,18 @@ internal sealed class ClassTools(LvaiConnection connection)
                 final["memberNames"] = MemberNamesOnDisk(lvclassPath);
                 final["dispatchFlags"] = DispatchFlagsOnDisk(lvclassPath);
 
+                // THE ICONS, before the source-only read: the icon save brings compiled code in and
+                // the icon step strips it again, so the check below sees the final file.
+                if (setIcons)
+                {
+                    var icons = new JsonArray();
+                    foreach (var vi in createdPaths.Distinct(StringComparer.OrdinalIgnoreCase))
+                        icons.Add(await DefaultIcon.ApplyAsync(connection, vi, null,
+                            DefaultIcon.Kind.ClassMember, lvclassPath, choice.Name, timeoutSeconds, ct));
+                    final["icons"] = icons;
+                    final["iconsSet"] = icons.Count(i => i?["ok"]?.GetValue<bool>() == true && i["skipped"] is null);
+                }
+
                 // SOURCE-ONLY, READ FROM EACH SAVED FILE - the user's standing rule is that every
                 // VI this server writes is source-only, asserted rather than assumed.
                 var sourceOnly = AccessorSourceOnly(createdPaths);
@@ -2577,9 +2610,10 @@ internal sealed class ClassTools(LvaiConnection connection)
         {
             try
             {
-                var (stripped, count, _) = StripHelperItems(File.ReadAllText(project), project);
+                var (projectText, projectStyle) = LvTextFile.Read(project);
+                var (stripped, count, _) = StripHelperItems(projectText, project);
                 removed = count;
-                if (removed > 0) File.WriteAllText(project, stripped);
+                if (removed > 0) LvTextFile.Write(project, stripped, projectStyle);
             }
             catch (Exception failure) { tidyError = failure.Message; }
         }

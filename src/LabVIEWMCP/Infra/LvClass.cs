@@ -968,12 +968,10 @@ internal static class LvClass
     /// </summary>
     public static string? SetProjectSourceOnly(string projectPath)
     {
-        var bytes = File.ReadAllBytes(projectPath);
-        var bom = bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF;
-        var text = new UTF8Encoding(false).GetString(bytes, bom ? 3 : 0, bytes.Length - (bom ? 3 : 0));
+        var (text, style) = LvTextFile.Read(projectPath);
         var (changed, action) = WithProjectSourceOnly(text);
         if (action is null or "alreadyTrue") return action;
-        File.WriteAllText(projectPath, changed, new UTF8Encoding(bom));
+        LvTextFile.Write(projectPath, changed, style);
         return action;
     }
 
@@ -1050,27 +1048,39 @@ internal static class LvClass
     /// space. None of that stops LabVIEW loading the project - the load check passed throughout -
     /// but <c>lvproj-structure.md</c> section 8 keeps those rules precisely so a diff against a
     /// LabVIEW-saved file is signal rather than noise, and the second class written into a project
-    /// reformatted what the first one wrote. A line insert preserves the style, the line endings
-    /// and the BOM of whatever file it is handed, including one LabVIEW wrote itself.
+    /// reformatted what the first one wrote. A line insert preserves the style and the line
+    /// endings of whatever file it is handed, including one LabVIEW wrote itself - and, since
+    /// 2026-10-12, the BOM too. This sentence claimed the BOM until then while the code read the
+    /// file with <c>File.ReadAllText</c>, which strips it, and wrote it with
+    /// <c>File.WriteAllText</c>, which writes none: every class added this way dropped the BOM
+    /// LabVIEW had saved. <see cref="LvTextFile"/> is the reader and writer now.
     /// </summary>
-    public static bool AddToProject(string projectPath, string className, string relativeUrl)
-    {
-        var name = $"{className}.lvclass";
+    public static bool AddToProject(string projectPath, string className, string relativeUrl) =>
+        AddOwnerToProject(projectPath, $"{className}.lvclass", "LVClass", relativeUrl);
 
+    /// <summary>
+    /// <see cref="AddToProject"/> for a library: one <c>Type="Library"</c> item at target level,
+    /// written the same way and refused the same way when it is already listed.
+    /// </summary>
+    public static bool AddLibraryToProject(string projectPath, string libraryFileName, string relativeUrl) =>
+        AddOwnerToProject(projectPath, libraryFileName, "Library", relativeUrl);
+
+    private static bool AddOwnerToProject(string projectPath, string name, string type, string relativeUrl)
+    {
         var document = XDocument.Load(projectPath);
         var target = document.Root?.Elements("Item")
             .FirstOrDefault(i => (string?)i.Attribute("Type") == "My Computer")
             ?? throw new InvalidDataException(
-                $"'{projectPath}' has no <Item Type=\"My Computer\"> target to add the class to.");
+                $"'{projectPath}' has no <Item Type=\"My Computer\"> target to add the {type} to.");
 
         var already = target.Elements("Item").Any(i =>
-            (string?)i.Attribute("Type") == "LVClass" &&
+            (string?)i.Attribute("Type") == type &&
             (string.Equals((string?)i.Attribute("Name"), name, StringComparison.OrdinalIgnoreCase) ||
              string.Equals((string?)i.Attribute("URL"), relativeUrl, StringComparison.OrdinalIgnoreCase)));
         if (already) return false;
 
-        var text = File.ReadAllText(projectPath);
-        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var (text, style) = LvTextFile.Read(projectPath);
+        var newline = style.Newline;
         var lines = text.Split(newline).ToList();
 
         // Anchor on Dependencies, then Build Specifications: both are machine-managed and always
@@ -1087,9 +1097,9 @@ internal static class LvClass
 
         var indent = lines[anchor][..(lines[anchor].Length - lines[anchor].TrimStart().Length)];
         lines.Insert(anchor,
-            $"{indent}<Item Name=\"{Xml(name)}\" Type=\"LVClass\" URL=\"{Xml(relativeUrl)}\"/>");
+            $"{indent}<Item Name=\"{Xml(name)}\" Type=\"{type}\" URL=\"{Xml(relativeUrl)}\"/>");
 
-        File.WriteAllText(projectPath, string.Join(newline, lines));
+        LvTextFile.Write(projectPath, string.Join(newline, lines), style);
         return true;
     }
 
@@ -1230,9 +1240,27 @@ internal static class LvClass
         var missing = vis.Where(v => !listed.Contains(v.Name)).ToList();
         if (missing.Count == 0) return 0;
 
-        var text = File.ReadAllText(projectPath);
-        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var (text, style) = LvTextFile.Read(projectPath);
+        var newline = style.Newline;
         var lines = text.Split(newline).ToList();
+
+        // NO FOLDER = TARGET LEVEL, beside the classes and libraries: the caller asked for it by
+        // name (lvai_add_vis_to_project's targetLevel). Same anchor as the folder case below.
+        if (string.IsNullOrEmpty(folderName))
+        {
+            var top = lines.FindIndex(l => IsItemOfType(l, "Dependencies"));
+            if (top < 0) top = lines.FindIndex(l => IsItemOfType(l, "Build"));
+            if (top < 0)
+                throw new InvalidDataException(
+                    $"'{projectPath}' has neither a Dependencies nor a Build Specifications item, " +
+                    "so there is no anchor to insert before.");
+            var topIndent = Indent(lines[top]);
+            foreach (var vi in Enumerable.Reverse(missing))
+                lines.Insert(top,
+                    $"{topIndent}<Item Name=\"{Xml(vi.Name)}\" Type=\"VI\" URL=\"{Xml(vi.Url)}\"/>");
+            LvTextFile.Write(projectPath, string.Join(newline, lines), style);
+            return missing.Count;
+        }
 
         var folderOpen = $"<Item Name=\"{Xml(folderName)}\" Type=\"Folder\">";
         var folderIndex = lines.FindIndex(l => l.TrimStart().StartsWith(folderOpen,
@@ -1286,7 +1314,7 @@ internal static class LvClass
             lines.Insert(at,
                 $"{indent}<Item Name=\"{Xml(vi.Name)}\" Type=\"VI\" URL=\"{Xml(vi.Url)}\"/>");
 
-        File.WriteAllText(projectPath, string.Join(newline, lines));
+        LvTextFile.Write(projectPath, string.Join(newline, lines), style);
         return missing.Count;
 
         static string Indent(string line) => line[..(line.Length - line.TrimStart().Length)];
@@ -1340,8 +1368,8 @@ internal static class LvClass
             .ToList();
         if (hits.Count == 0) return [];
 
-        var text = File.ReadAllText(projectPath);
-        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var (text, style) = LvTextFile.Read(projectPath);
+        var newline = style.Newline;
         var lines = text.Split(newline).ToList();
 
         var removed = new List<string>();
@@ -1358,7 +1386,7 @@ internal static class LvClass
             removed.Add(hit.Name);
         }
 
-        if (removed.Count > 0) File.WriteAllText(projectPath, string.Join(newline, lines));
+        if (removed.Count > 0) LvTextFile.Write(projectPath, string.Join(newline, lines), style);
         removed.Reverse();
         return removed;
     }
@@ -1382,8 +1410,8 @@ internal static class LvClass
             .ToList();
         if (hits.Count == 0) return [];
 
-        var text = File.ReadAllText(projectPath);
-        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var (text, style) = LvTextFile.Read(projectPath);
+        var newline = style.Newline;
         var lines = text.Split(newline).ToList();
 
         var removed = new List<string>();
@@ -1400,7 +1428,7 @@ internal static class LvClass
             removed.Add(hit.Name);
         }
 
-        if (removed.Count > 0) File.WriteAllText(projectPath, string.Join(newline, lines));
+        if (removed.Count > 0) LvTextFile.Write(projectPath, string.Join(newline, lines), style);
         removed.Reverse();
         return removed;
     }
@@ -1464,8 +1492,8 @@ internal static class LvClass
         var hits = DuplicateViEntries(projectPath);
         if (hits.Count == 0) return [];
 
-        var text = File.ReadAllText(projectPath);
-        var newline = text.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var (text, style) = LvTextFile.Read(projectPath);
+        var newline = style.Newline;
         var lines = text.Split(newline).ToList();
 
         var removed = new List<string>();
@@ -1482,7 +1510,7 @@ internal static class LvClass
             removed.Add(hit.Name);
         }
 
-        if (removed.Count > 0) File.WriteAllText(projectPath, string.Join(newline, lines));
+        if (removed.Count > 0) LvTextFile.Write(projectPath, string.Join(newline, lines), style);
         removed.Reverse();
         return removed;
     }

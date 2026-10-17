@@ -1136,6 +1136,18 @@ upgrades `ok`, because it is stronger evidence than the diagnostics that failed 
 **Five unit tests and three script-level measurements all passed while this was broken**, because
 every one of them tested a piece rather than the composition.
 
+**THE ERROR 91 WAS NOT AN ARTEFACT TO LIVE WITH - it had a cause, found 2026-10-13.** It is
+`Variant To Data` inside `RunVIAsTopLevel`, and it hits every `bool` and `int32` indicator: those
+come back EMPTY, while every `string` indicator arrives. So `found`, `code`, `wired before` and the
+whole right side read null on EVERY run - which is why `rightSide` said `unknown` every time, and why
+a RE-RUN said `helperDidNotAnswer`: with the VI already wired the bundle step has nothing to change,
+so nothing upgraded `ok`. Every bool and int32 indicator of the helper is now a `string` fed by
+`Flatten To XML` (as `wire ends after` always was), and the tool reads the `<Val>`. Measured after
+the change: RPC `errorCode 0`, a first run `ok: true` on its own with `rightSide.status: wired`, the
+re-run `ok: true` with `alreadyWired`, and no project active answering `noActiveProject` from a real
+`code: 1055` with the class list empty. `scripts/lvai_wire_dyn_events.xml` must not grow a non-string
+indicator again; a unit test holds it to that.
+
 **`dynIndex` is the registration item's position and only `1` is measured** - a structure fed
 several user events needs the real one. Which of `regFlags`, `type` and `dynIndex` is decisive is
 also not isolated; they were changed together from `0 / 0 / 2`. `type 1000` is `0x03E8` and equals
@@ -1253,9 +1265,18 @@ Measured end to end on fresh unwired copies of the template-derived VI. Tunnel r
 **two** ends on the terminal, and the render showing a NEW tunnel on the loop border with the wire
 running through it.
 
-**Two limits it reports rather than hides.** The search is **two levels** - the block diagram and
-the diagrams of every `WhileLoop`, `ForLoop`, `TimedLoop` and `CaseStructure` on it - and a miss
-comes back with the class names it did see. And the destination is the FIRST terminal named
+**Two limits it reports rather than hides.** The search is **NI's `Traverse for GObjects.vi`**
+(`VI Scripting - Traverse.lvlib`, `Class Name` = `EventStructure`, `Traverse Target` = 1), so it
+reaches an Event Structure at any depth; the fallback's `Register For Events` node is found the
+same way. Until 2026-10-12 it was a hand-written search two levels deep - the block diagram and the
+diagrams of every `WhileLoop`, `ForLoop`, `TimedLoop` and `CaseStructure` on it - and the standard
+Actor Framework helper-loop shape, an Event Structure in a Case frame in a While Loop, is THREE
+levels: that answered `noEventStructureFound` (or `helperDidNotAnswer`) and changed nothing.
+`Traverse` is the call `lvai_swap_subvis` already makes for `SubVI`, measured there reaching calls
+inside Case frames inside a loop; for `EventStructure` and `RegisterForEvents` it is not yet
+measured. `eventStructuresFound` is Traverse's count, and with more than one the FIRST is wired
+and the note says so - which one Traverse lists first is not measured. A miss still comes back
+with the TOP-LEVEL class names. And the destination is the FIRST terminal named
 `Event Registration Refnum` that is not a source: three terminals carry that name (the dynamic
 input, the dynamic output, the tunnel), `Is Source?` excludes the output - measured `true` for it -
 and the input is told from the tunnel by `Terminals[]` order, which mirrors the heap's term list.
@@ -1268,6 +1289,64 @@ answered `Error 1055` in the probes that led here, and they read perfectly in th
 difference is not the downcast: it is that the earlier loop also read **`Connected Wire`** on a
 terminal that had none. One property node per reference, and no `Connected Wire` on a terminal you
 have not established as wired.
+
+#### The RIGHT side, and the tunnel it leaves unwired - added 2026-10-12
+
+**Accepted on BOTH backends on 2026-10-17**, on one probe: the user-event skeleton with its Event
+Structure moved into the True frame of a Case Structure inside the While Loop, and `Unregister For
+Events` left unwired. On `grpc` (`lvai_generate_vi_with_events`, then this tool) one call found the
+structure at that depth (`eventStructuresFound: 1`), branched the left side, wired the right side
+(`wireEndsAfter: 2`), set `Use Default if Unwired` on the one new case tunnel, finished the
+user-event frame and answered `execState 1`. On `pylabview` the composer had already wired the left
+side and registered the frame, so the call answered `alreadyWired` for it and still wired the right
+side and set the flag - the composed helper reads the new string indicators. Both VIs then ran:
+`Ticks Received = 5`, `error out` 0.
+
+**`wireRightSide` (default true) wires the other end too**: the structure's SOURCE-side
+`Event Registration Refnum` terminal (`Is Source?` TRUE) to the `event registration refnum` input
+of `Unregister For Events`, `Auto Wire` and `Auto Route` TRUE, LabVIEW making the tunnels on the
+way out. The shape is the one a helper measured on an Actor Framework helper loop; it is new in
+this tool and its first LabVIEW run is the acceptance. `Unregister For Events` has no class of its
+own - it is a plain `Function` - so it is found by `Traverse` with `Class Name` `Function`, kept
+only when its `Class Name` is EXACTLY `Function` (whatever Traverse matches on) and it carries a
+SINK named `event registration refnum` in lower case. `Register For Events` carries a sink of that
+name too, and is class `RegisterForEvents`, which is why the exact-class filter is there.
+`rightSide` reports: `{skipped: "notReached"}` when the helper stopped before it searched (no
+active project), `{skipped: "noUnregisterForEvents"}` for none, `{refused:
+"multipleUnregisterForEvents"}` with `unregisterNodes` for more than one (`Flush Event Queue` is
+spelled the same way, unmeasured), `alreadyWired` when the input carries a wire from anywhere -
+the usual generated shape, `Register For Events` wired straight into `Unregister` - and `wired`
+with `wireEndsAfter`. The right side runs on its OWN error branch inside a Case Structure: the
+left side's error passes through the case untouched and feeds `Save.Instrument`, so a right-side
+failure (`errorKind: rightSideNotWired`) never throws the left wire away.
+
+**The tunnel that wire creates on an enclosing Case Structure is UNWIRED in every other frame,
+and an output tunnel with no value in a frame breaks the VI.** That is the Actor Framework helper
+loop exactly: the Event Structure sits in the No Error frame of a Case Structure, and the Error
+frame has nothing to give the new output tunnel. The IDE answer is the tunnel's `Use Default if
+Unwired`, and AIXML refuses that property on a Property Node (`Invalid property`) -
+`docs/vi-server-reference.md` records the row and why it was added by hand. So it is set in the
+pylabview bundle: `scripts/pylv-set-use-default.py` ORs `0x200000` into the `selTun`'s `objFlags`
+(a plain output tunnel reads `0x801`, one LabVIEW has seen unwired in a frame `0x100801`, a
+use-default one `0x300801` - read off a wizard-generated accessor and off the run that patched it).
+
+**Only tunnels this call created, and that is decided by a BASELINE, not by a shape.** The tool
+extracts the VI before the helper saves over it, and the script touches a Case Structure (`select`)
+output tunnel only if its uid is absent from that baseline, it lacks the flag, and one of its inner
+terminals (every `termList` uid but the last, one per frame) lacks the WIRED bit `0x8000`. A tunnel
+the user already had is never changed, even one broken the same way - that would change what their
+code does. "Absent from the baseline" is only sound while LabVIEW keeps the uids of what existed;
+observed on one VI (generated structure uids survived LabVIEW's load, a `Connect Wire` and a save,
+while the new tunnels got low LabVIEW-assigned uids), not established as a rule. So the script
+also REFUSES, patching nothing, when any baseline tunnel uid is missing afterwards - a wire
+addition removes no tunnel. Run against the real bundle of that run, its output was byte-identical
+to the file that run patched by hand. `useDefaultSet` names what was set.
+
+**It is ONE round trip with the user-event step**, not a second one: extract, finish the
+user-event specs, set the flags, strip the compiled code, CLOSE THE ACTIVE PROJECT (saving it),
+rebuild, `execState`. It runs when either half has something to do and is skipped entirely -
+project left open - when neither has. `projectClosed` and `projectClosedFor`
+(`userEvents`, `useDefault`) say whether and why.
 
 #### Superseded, kept for the process lesson: "the renderer draws no wire"
 

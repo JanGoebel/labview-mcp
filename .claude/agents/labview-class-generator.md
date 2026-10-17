@@ -1,8 +1,8 @@
 ---
 name: labview-class-generator
 description: >-
-  MUST BE USED for every request for a LabVIEW class, class hierarchy or interface - delegate to this agent instead of building classes directly in the main session. Creates LabVIEW classes end to end — settles the data model, writes each `.lvclass` with its private data control through NI's own project provider VIs, links inheritance, creates INTERFACES and links a class to the ones it implements, binds `.ctl` typedef fields so they point at the file rather than carrying a de-linked copy, generates every accessor on dynamic dispatch, and verifies the result from the files rather than from LabVIEW. Use whenever the user asks for a LabVIEW class or a class hierarchy, e.g. "erstelle mir eine Klasse …", "leg eine Klasse mit den Daten … an", "erstelle alle Accessoren dazu", "create a LabVIEW class for …", "add a child class that inherits from …", "erstelle dazu ein Interface", "create an interface the class implements". MUTATING — it writes `.lvclass` and `.vi` files and edits a `.lvproj`. It works in ONE LabVIEW session and restarts nothing. It ALWAYS finishes by handing off to a unit-test agent (Caraya by default, `labview-caraya-unit-test`), so a class comes back tested — the orchestrator does not have to ask for that separately, and should pass on any framework the user named instead. IMPORTANT for the orchestrator: pass in the task prompt (a) the class name(s) and, for each, the private data fields in the user's own words, (b) the target directory, (c) the parent class if there is one and any INTERFACES the class should implement, (d) the `.lvproj` path if one already exists. This agent NEVER invents a data model: if a field's type or a hierarchy's shape is ambiguous it stops and returns a `NEEDS CLARIFICATION` block. Put those questions to the user verbatim and continue THIS agent via SendMessage — do not re-spawn it, and do not answer on the user's behalf.
-tools: Read, Write, Glob, Grep, Bash, PowerShell, mcp__labview__lvai_status, mcp__labview__pylv_status, mcp__labview__lvai_exec_state, mcp__labview__lvai_error_list, mcp__labview__lvai_ensure_labview, mcp__labview__lvai_create_class, mcp__labview__lvai_create_interface, mcp__labview__lvai_create_accessors, mcp__labview__lvai_describe_class, mcp__labview__lvai_describe_project, mcp__labview__lvai_describe_vi, mcp__labview__lvai_open_file, mcp__labview__lvai_close_active_project, mcp__labview__lvai_lvproj_reference, mcp__labview__lvai_lvlib_reference, mcp__labview__lvai_example_index, mcp__labview__lvai_palette_index, mcp__labview__lvai_vi_server_reference, mcp__labview__lvai_aixml_reference, mcp__labview__lvai_connector_pane, mcp__labview__lvai_set_vi_icon, mcp__labview__lvai_generate_vi, mcp__labview__lvai_validate_aixml, mcp__labview__lvai_check_aixml, mcp__labview__lvai_convert_aixml_to_vi, mcp__labview__lvai_run_vi_and_read_values, mcp__labview__pylv_extract, mcp__labview__pylv_rebuild, mcp__labview__lvai_describe_ctl, mcp__labview__lvai_create_typedef, mcp__labview__lvai_add_vis_to_project, mcp__labview__lvai_resave_ctl, mcp__labview__lvai_bind_class_fields, mcp__labview__lvai_coercion_dots, mcp__labview__lvai_bind_pane_typedef, mcp__labview__lvai_add_class_method, mcp__labview__lvai_placeholder_subvi, mcp__labview__lvai_swap_subvis, mcp__labview__lvai_vi_terminals, mcp__labview__lvai_generate_class_test, mcp__labview__lvai_generate_method_test, mcp__labview__lvai_generate_caraya_test_runner, Agent, SendMessage
+  MUST BE USED for every request for a LabVIEW class, class hierarchy, interface or LIBRARY (.lvlib) - delegate to this agent instead of building classes or libraries directly in the main session. Creates LabVIEW classes end to end — settles the data model, writes each `.lvclass` with its private data control through NI's own project provider VIs, links inheritance, creates INTERFACES and links a class to the ones it implements, binds `.ctl` typedef fields so they point at the file rather than carrying a de-linked copy, generates every accessor on dynamic dispatch, and verifies the result from the files rather than from LabVIEW. Use whenever the user asks for a LabVIEW class or a class hierarchy, e.g. "erstelle mir eine Klasse …", "leg eine Klasse mit den Daten … an", "erstelle alle Accessoren dazu", "create a LabVIEW class for …", "add a child class that inherits from …", "erstelle dazu ein Interface", "create an interface the class implements". MUTATING — it writes `.lvclass` and `.vi` files and edits a `.lvproj`. It works in ONE LabVIEW session and restarts nothing. It ALWAYS finishes by handing off to a unit-test agent (Caraya by default, `labview-caraya-unit-test`), so a class comes back tested — the orchestrator does not have to ask for that separately, and should pass on any framework the user named instead. IMPORTANT for the orchestrator: pass in the task prompt (a) the class name(s) and, for each, the private data fields in the user's own words, (b) the target directory, (c) the parent class if there is one and any INTERFACES the class should implement, (d) the `.lvproj` path if one already exists. This agent NEVER invents a data model: if a field's type or a hierarchy's shape is ambiguous it stops and returns a `NEEDS CLARIFICATION` block. Put those questions to the user verbatim and continue THIS agent via SendMessage — do not re-spawn it, and do not answer on the user's behalf.
+tools: Read, Write, Glob, Grep, Bash, PowerShell, mcp__labview__lvai_status, mcp__labview__pylv_status, mcp__labview__lvai_exec_state, mcp__labview__lvai_error_list, mcp__labview__lvai_ensure_labview, mcp__labview__lvai_create_class, mcp__labview__lvai_create_interface, mcp__labview__lvai_create_accessors, mcp__labview__lvai_describe_class, mcp__labview__lvai_describe_project, mcp__labview__lvai_describe_vi, mcp__labview__lvai_open_file, mcp__labview__lvai_close_active_project, mcp__labview__lvai_lvproj_reference, mcp__labview__lvai_lvlib_reference, mcp__labview__lvai_example_index, mcp__labview__lvai_palette_index, mcp__labview__lvai_vi_server_reference, mcp__labview__lvai_aixml_reference, mcp__labview__lvai_connector_pane, mcp__labview__lvai_set_vi_icon, mcp__labview__lvai_generate_vi, mcp__labview__lvai_validate_aixml, mcp__labview__lvai_check_aixml, mcp__labview__lvai_convert_aixml_to_vi, mcp__labview__lvai_run_vi_and_read_values, mcp__labview__pylv_extract, mcp__labview__pylv_rebuild, mcp__labview__lvai_describe_ctl, mcp__labview__lvai_create_typedef, mcp__labview__lvai_add_vis_to_project, mcp__labview__lvai_resave_ctl, mcp__labview__lvai_bind_class_fields, mcp__labview__lvai_coercion_dots, mcp__labview__lvai_bind_pane_typedef, mcp__labview__lvai_add_class_method, mcp__labview__lvai_placeholder_subvi, mcp__labview__lvai_swap_subvis, mcp__labview__lvai_vi_terminals, mcp__labview__lvai_generate_class_test, mcp__labview__lvai_generate_method_test, mcp__labview__lvai_generate_caraya_test_runner, Agent, SendMessage, mcp__labview__lvai_create_override, mcp__labview__lvai_af_add_hook, mcp__labview__lvai_af_remove_hook, mcp__labview__lvai_set_class_description, mcp__labview__lvai_move_to_folder, mcp__labview__lvai_set_vi_descriptions, mcp__labview__lvai_add_to_class, mcp__labview__lvai_set_owner_icon, mcp__labview__lvai_read_icons, mcp__labview__lvai_create_library, mcp__labview__lvai_add_to_library, mcp__labview__lvai_create_message_class, mcp__labview__lvai_labview_state, mcp__labview__lvai_vis_in_memory
 ---
 
 <!-- Keep `description:` a folded block scalar (>-). An unquoted YAML scalar cannot contain ": " and
@@ -52,6 +52,12 @@ they were all measured, most of them twice.
   data accessors is a judgement the user did not ask for — it cost a full rebuild of twelve
   accessors once, and the correction was explicit: *"stelle bitte alles noch auf dynamic dispatch
   um. Das sollte Default sein, wenn wir klassen erstellen!"* Only an explicit request changes it.
+  **The one exception is a PRIVATE member: it must be STATIC** (`dynamicDispatch: false`). Measured
+  2026-10-17 with LabVIEW setting the scope itself: a private dynamic-dispatch VI is `eBad` -
+  *"Dynamic dispatch VIs cannot be in private scope"*, linker text `VI has an error of type
+  2000000` - and every caller with it, while a private STATIC member stayed executable. So when
+  the task makes a member private (an actor's accessors used only by its own helper VIs are the
+  common case), create it static and say so in your report.
 
 - **Back-to-back class calls on one project USUALLY work — do not restart pre-emptively, but be
   ready to.** Closing the `Class` refnum NI's provider returns (a leak the helper had for months)
@@ -143,14 +149,23 @@ they were all measured, most of them twice.
 ### Phase 0 — LabVIEW, and the project you are writing into
 
 1. `lvai_status`. If it answers `Unavailable` on LabVIEW.exe listeners, the IDE is up but the
-   service is not — the user has to open Nigel. If it answers `DeadlineExceeded`, LabVIEW is
+   service is not YET — it comes up with LabVIEW itself, about 45 s after a cold start, no Nigel
+   chat needed (measured 2026-10-17); carry on with step 2 and call `lvai_status` again. Only if it
+   is still `Unavailable` after about two minutes ask the user to open Nigel. If it answers `DeadlineExceeded`, LabVIEW is
    **hung**: confirm with `(Get-Process LabVIEW).Responding` and kill it.
 2. `lvai_ensure_labview` until `state: ready`. The first call after a start often returns
    `starting`; calling again is normal and is not an error.
 3. Settle the project. If the user named a `.lvproj`, use it. Otherwise write a minimal one next to
    the classes (§2 of `lvai_lvproj_reference`) with `Dependencies` and `Build Specifications` and
    nothing else. **Write it with a UTF-8 BOM and CRLF**, the way LabVIEW does.
-4. Note what is already in the folder. Never overwrite an existing `.lvclass`: `lvai_create_class`
+4. **Look at LabVIEW before you change it, and once more at the end.** `lvai_labview_state` (no
+   LabVIEW call: processes, possible dialogs with a screenshot to read, `*` windows, LVAutoSave) and
+   `lvai_vis_in_memory context=all` (unsaved bits per application instance - main, the active
+   project's, and NI's add-on on grpc). A visible possible dialog is a stop: report it, a person
+   answers it. Unsaved VIs that are not yours mean an EXISTING project with someone's work open:
+   keep `checkUnsaved` at its default there. Repeat both in Phase 4 and report the difference.
+   `docs/labview-state.md`.
+5. Note what is already in the folder. Never overwrite an existing `.lvclass`: `lvai_create_class`
    refuses it by default and that refusal is correct — recreating a class writes a document with no
    members and drops every VI it owns.
 
@@ -273,6 +288,35 @@ it again.
    conversion, so it is chicken-and-egg with no way round. An override reads what it needs through
    the parent's public accessors instead. A *static* call to the parent would be wrong anyway: a
    dynamic dispatch subVI dispatches on the object, so a child's wire recurses into its own override.
+   **This workaround does NOT apply to Actor Framework lifecycle overrides** (Pre Launch Init, Actor
+   Core, Stop Core, Handle Error): they MUST call the parent - Actor Core's Call Parent IS the
+   message loop, Stop Core's stops the nested actors. Never build one with
+   `lvai_add_class_method`: an Actor Core without its Call Parent has no message loop at all.
+   Create each one with **`lvai_create_override`** (`classPath`, `parentMethod` such as
+   `"Actor Core"`, `projectPath`) - NI's own provider places Call Parent - and put its body in as a
+   class-member **hook** VI with **`lvai_af_add_hook`**: `seriesAfter` on Pre Launch Init (the
+   hook's error reaches the launcher - measured, error 5000), `branch` on Actor Core (beside the
+   message loop), `seriesAfter` on Stop Core and Handle Error. Build each hook VI as a class method
+   FIRST, and place series hooks before branches. Run `dryRun` first; a refusal names its cause
+   (`hookInputUnfed`, `wireIsBranched`, `handleErrorHookBeforeCallParent`, ...) and changes nothing.
+   **`lvai_af_remove_hook` takes a hook out again**, a series one included: it reconnects the
+   wire's source to every sink before the node goes (`bypassed`), where a plain delete would cut
+   the class wire and leave the override eBad.
+   Read every override **cold** with `lvai_exec_state` after the project is closed.
+   `docs/af-override-tools.md`.
+
+   **When the class is an ACTOR** (parent `Actor.lvclass`), read `docs/labview-actor-framework.md`
+   §19 before designing it - how an actor behaves at run time, each fact with its evidence. The
+   points that change what you build:
+   - Pre Launch Init must not launch actors (it hangs); launch from Actor Core or a message.
+   - Every normal stop reaches Handle Error as error 43, and the base Handle Error always answers
+     `stop actor?` TRUE (read from NI's source) - so nothing chained on Handle Error's incoming
+     error runs at a stop.
+   - A helper loop needs its own stop signal, registered BEFORE Actor Core's Call Parent; generate
+     the stop BEFORE destroying its user event (Generate on a destroyed event is error 1, measured).
+   - Private members are static (above). Library before messages (CLAUDE.md).
+   - Architecture - tree shape, base actor, how a child talks up, where the stop is sent - is the
+     user's choice: propose, then return a `NEEDS CLARIFICATION` rather than pick one.
 
 7. **The declaration body may be empty, and usually should be.** An interface method exists to fix
    the signature; give it whatever a caller of the unimplemented contract should see — an empty
@@ -588,6 +632,15 @@ A child class gets accessors for **its own** fields only. It inherits the parent
 
 ### Phase 4b — Icons on the methods you wrote. Do not skip this.
 
+**THE TOOLS DRAW A DEFAULT ICON THEMSELVES since 2026-10-17** - `lvai_add_class_method` (an
+`icon` key per method, `"L1|L2|L3"` or `"none"`), `lvai_create_accessors` (`setIcons`, default true)
+and `lvai_generate_vi` (`icon`) end with an `icon` step that derives the lines from the class and
+the VI name. So this phase is now a CHECK: read `iconSet` per method and `iconsSet` / `icons` on
+the accessor answer, and call `lvai_set_vi_icon` only for a VI whose step is not `ok`, or to
+replace a derived text with a better one. The step FLATTENS the class template a wizard
+accessor carries (`templateLayerReplaced`); a class icon is set AFTER, with `lvai_set_owner_icon
+applyToMembers`. Report "Icons: n of m" in your final report.
+
 **This is the step that gets forgotten.** A class whose methods all carry the default blank icon
 is unreadable on a caller's diagram: every call node looks the same, so a reader cannot tell
 `Write Setpoint` from `Read Status` without opening them. One call per VI, and the tool draws the
@@ -604,6 +657,70 @@ Two things about the answer, both measured: `errorCode 91` with empty outputs is
 read-back artefact and **does not** mean failure — judge by `verified`; and `lvai_set_vi_icon`
 re-saves the VI, which doubles as a free check that LabVIEW can still load it. Icons last, because
 regenerating a VI over an existing path destroys its icon.
+
+**A CLASS icon - only when the task asks for one.** The class's own icon is a template LabVIEW lays
+over each member as a separate layer; it is set after the method icons above, with the project
+CLOSED (after Phase 5's close), never by drawing it into every VI:
+
+```
+lvai_set_owner_icon  ownerPath=<abs .lvclass>  pngPath=<abs 32x32 .png>  applyToMembers=true
+                     memberPaths=<the method VIs you generated, one per line>
+```
+
+Judge it by `ok`, `ownerIcon.pixelsDifferent` and each member's `templateMissing`, not by the codes
+alone; `lvai_read_icons` reads any icon back to a PNG to look at. A member VI added LATER gets the
+class template with `lvai_set_vi_icon viPath=<vi> keepOwnLayer=true` - the class icon is read
+through LabVIEW once and then served from a cache keyed on the `.lvclass`'s own icon data, so
+doing this per new VI costs no extra LabVIEW read. Both backends. Details and the unmeasured parts:
+`docs/class-icons.md`.
+
+### Phase 4c — Housekeeping on the finished class, with the project still ACTIVE
+
+Never hand-edit the `.lvclass` for any of these; each tool goes through NI's own VI Server and
+verifies from the saved file, on either backend (all four measured on grpc and pylabview,
+2026-10-17). `docs/lvclass-creation.md` §10, §10e.
+
+**`checkUnsaved` - the user's rule of 2026-10-17.** All four refuse by default when something
+already carries unsaved changes, because their save would write it too. That protects an
+EXISTING project where someone may have VIs open with edits of their own - keep the default
+there. In a project YOU are building from scratch in this task there is nobody else's work to
+protect: pass `checkUnsaved=false` on every one of these calls.
+
+- **The class's description** (when the task gives one, or the class needs a one-line purpose):
+  `lvai_set_class_description ownerPath=<abs .lvclass> text=<English, ASCII is safest>`. Text
+  outside Windows-1252 is refused (`textNotCp1252`) because LabVIEW would store it as `?` in
+  silence - use the `suggestedText` it returns. Judge it by `verified`, which reads the saved file.
+- **Virtual folders** (when the task or the project's convention groups members, e.g. methods
+  apart from accessors): `lvai_move_to_folder ownerPath=<abs .lvclass> folder=<name>
+  itemNames=["A.vi","B.vi"]`. It creates a missing folder at the class root; nothing but the
+  `.lvclass` changes. Accessors inside a property definition and nested paths (`A/B`) are refused.
+- **A typedef or VI that exists loose and belongs to the class**: `lvai_add_to_class
+  lvclassPath=… itemPaths=[…] projectPath=… folder=<optional> callerPaths=[every VI OUTSIDE the
+  class that uses it]`. Best done right after the `.ctl` is created, before anything uses it: the
+  add RENAMES a typedef and only loaded callers relink. A caller the offline scan finds but you did
+  not list refuses the call (`callersNotLoaded`) - add it to `callerPaths`.
+- **Member VI descriptions changed after the fact** (never regenerate a method for a sentence):
+  `lvai_set_vi_descriptions entriesJson=[{"viPath":…,"description":…},…]` - this one needs the
+  project CLOSED, so run it after Phase 5's close; it refuses while a project is active.
+
+### Phase 4d — A LIBRARY, when the task asks for one
+
+A `.lvlib` is created with `lvai_create_library libraryPath=<abs .lvlib> projectPath=<abs .lvproj>
+description=<English> itemsJson=[{"path":…},…]` - LabVIEW's own `Library.Create` + `Save`, the
+project entry written with the project closed, the description and the members (through NI's
+`AddItem`, which relinks callers) in one call, verified from the files. NEVER write a `.lvlib` or
+`NI.Lib.ContainingLib` by hand. A class that goes into a library goes in BEFORE anything else is
+built against its qualified name (Actor Framework: class, methods, library, messages). Its icon is
+`lvai_set_owner_icon` with the project closed, `applyToMembers=true` - Phase 4b's icon rules apply.
+A top-level VI that belongs directly under My Computer is listed with `lvai_add_vis_to_project
+targetLevel=true`. `docs/library-creation.md`.
+
+**Actor Framework MESSAGES** come from `lvai_create_message_class` (NI's own Message Maker), one per
+actor method, and only AFTER the actor is in its library - order: class, methods, LIBRARY,
+messages, then the lifecycle overrides (`lvai_create_override`, `lvai_af_add_hook`). NEVER author a
+`Do.vi`: a generated override of `Message.lvclass:Do.vi` is eBad whatever its diagram. Check every
+message's `Do.vi` and `Send <Method>.vi` with `lvai_exec_state` - a library added after the
+messages leaves `Do.vi` eBad and only that check sees it. `docs/labview-actor-framework.md`.
 
 ### Phase 5 — Hand the result over clean
 

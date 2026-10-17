@@ -16,6 +16,7 @@ session.
 | implement a SUPPLIED VI whose front panel must be kept (exam template) | `labview-vi-generator` - pass the supplied VI; it grafts (Phase 6g) |
 | change an existing VI | `labview-vi-editor` |
 | a class, class hierarchy or interface | `labview-class-generator` |
+| a library (`.lvlib`), its members, description and icon | `labview-class-generator` |
 | unit tests (default framework) | `labview-caraya-unit-test` |
 | LUnit / VI Tester tests, only when named | `labview-lunit-unit-test` / `labview-vitester-unit-test` |
 | documentation | `labview-doc-generator` |
@@ -189,7 +190,10 @@ application, and `grep -a` a generated caller's link paths. `docs/aixml-call-loa
 validation name now, not one per call.** The user's exit dialog of 2026-09-26 listed 54 unsaved
 `LVMCP Validate <hash>.vi`. By name they are in NONE of the instances VI Server reaches (helpers',
 IDE main over TCP, active project), with positive controls, and the converter's `1051` does not see
-them either - so they cannot be closed afterwards. `ValidationScratch` hands every validation
+them either - so they cannot be closed afterwards. **Qualified 2026-10-17: over ActiveX they ARE
+visible** - `lvai_vis_in_memory context=main` lists `LVMCP Validate.vi`, `LVMCP Validate2vi` …
+in LabVIEW's main instance, opens each by that listed name and reads nonzero modification bits;
+closing them that way is not measured. `docs/scratch-vis-in-memory.md` §1a. `ValidationScratch` hands every validation
 `LVMCP Validate.vi`; a validation under a reused name answers exactly as a fresh one, measured, and
 conversion keeps a unique name because a failed convert burns its own. **It does NOT shrink to one
 entry - measured 2026-10-06**: LabVIEW NUMBERS a name already in memory, and after one long day the
@@ -368,8 +372,20 @@ there is no dot and no constant — the bare type travels into whatever consumes
 `docs/typedef-constants.md` has the measurements, including why `Create Constant` alone is not the
 fix and the two traps around `Replace`.
 
+**A CLASS INSIDE A CLUSTER IS A STAND-IN AT THE ELEMENT, and the caller's own cluster still has to
+be bound afterwards.** Since 2026-10-11 `lvai_placeholder_subvi` writes
+`cluster{ref{UDClassInst}.hardware,uint32.intervalMs}` as `cluster{path.hardware,uint32.intervalMs}`
+- it collapsed the whole terminal to a scalar `path` before, so a caller could not wire its cluster
+at all - and names each such element under `classElementsInClusters`. The swap then lands, but the
+CALLER's cluster source still carries a `path` element where the real subVI wants the class. For a
+pane CONTROL the follow-up is `lvai_bind_pane_typedef`. For a cluster CONSTANT it is
+`lvai_swap_subvis` with the typedef's **`.ctl` path as that constant's `class`** in `constantsJson`:
+`{LV.Constant}` `Replace` with a `.ctl` turns a bare cluster constant into a typedef constant. That
+route was OBSERVED in a field run and is NOT YET MEASURED here - check the result with
+`lvai_coercion_dots` and `lvai_exec_state`. `docs/typedef-constants.md` §5a.
+
 The tool clones the subject's pane, caches the stub in `user.lib\LV_MCP\` under a hash of the
-signature, and hands back the `Call` element and the matching `retarget` operation. **Do not hunt
+TARGET and its signature, and hands back the `Call` element and the matching `retarget` operation. **Do not hunt
 the palette for a stand-in and do not hand-write one**: a borrowed placeholder needs a lucky hit per
 signature and forces the SUBJECT's pane to be reshaped, which then breaks on every regeneration —
 `7101, At least one test is not in a executable state`, with nothing in the message about panes.
@@ -1620,7 +1636,10 @@ metric is not the corruption metric, and reading it as one gave the opposite con
 first-run path — the same `dropExistingMembers` step `lvai_lunit_add_test_method` already had. It
 therefore needs `projectPath`: without one the edit would be undone by LabVIEW's own save, so the
 re-run is REFUSED (`memberAlreadyListedWithoutProject`), and a class file the remover declines stops
-the call (`memberEntryCouldNotBeDropped`) instead of proceeding hopefully. Read `privateDataBytes`
+the call (`memberEntryCouldNotBeDropped`) instead of proceeding hopefully. A member a LOADED VI
+calls (an override hook) still fails the re-add with 56003 after the drop, so a re-run first asks
+the project's instance for its callers and refuses with `memberHasLoadedCallers` (unmeasured;
+`docs/af-override-tools.md` §5). Read `privateDataBytes`
 before and after anyway — it costs no LabVIEW and nothing else in the chain reports anything.
 Repair of an already-damaged class is a rebuild: `lvai_create_accessors` with an explicit
 `fromField` DUPLICATES rather than repairs (NI's wizard appends a number; the tool catches that
@@ -1639,6 +1658,21 @@ terminals** for a VI that is not yet a class member, so every wire is refused
 chicken-and-egg with no way round it. An override reads what it needs through the parent's public
 accessors instead. Note a *static* call to the parent's method would be wrong anyway: a dynamic
 dispatch subVI dispatches on the object, so a child's wire recurses into the child's own override.
+**That workaround does NOT apply to Actor Framework lifecycle overrides** (Pre Launch Init, Actor
+Core, Stop Core, Handle Error, Handle Last Ack Core): they must call the parent - Actor Core's Call
+Parent is the message loop, Stop Core's stops the nested actors - so never build one with
+`lvai_add_class_method`. Create them with `lvai_create_override`, which has NI's provider place Call
+Parent, and script their bodies with `lvai_af_add_hook` (ported from a colleague's fork on
+2026-10-17). `docs/af-override-tools.md`.
+
+**A PRIVATE CLASS MEMBER MUST BE STATIC - measured 2026-10-17.** A private dynamic-dispatch VI is
+`eBad` (*"Dynamic dispatch VIs cannot be in private scope"*, linker text `error of type 2000000`)
+and so is every caller; a private static member in the same class stayed executable. It is the one
+exception to "dynamic dispatch is the default". And setting the scope by editing
+`NI.ClassItem.MethodScope` in the `.lvclass` does NOTHING - LabVIEW ignored it through a cold
+restart, and a caller outside the class still ran. Through VI Server (`{LV.Project}` `Proj Item
+From Ref` -> `{LV.LVClassLibrary}` `Set Source Scope` -> `Save`) LabVIEW writes `NI.LibItem.Scope`
+beside it and changes `NI.ClassItem.State`, and only then is the member private.
 
 **CLOSE EVERY REFNUM A PROVIDER HANDS BACK, and treat a leak as a correctness bug rather than an
 untidiness.** `Add Class to Project (path).vi` returns a `Class` reference; leaving it open kept the
@@ -2148,9 +2182,15 @@ placeholders cached "by signature" would give `Minimum Value`, `Maximum Value`, 
 inherited `Sample Rate` — all class + double — one indistinguishable socket. Measured the same day:
 `PlaceholderTools.Signature` puts the terminal NAME in the hash
 (`o:Minimum Value:double:2:recommended`), so those four produced four distinct stubs, and nine
-accessors produced nine. **Field names are unique within a class by construction, so accessor sockets
-cannot collide.** The collapse is real only for panes that are identical NAME INCLUDED — two methods
-with the same terminal names, not two fields with the same type.
+accessors produced nine. **For ACCESSORS that holds: field names are unique within a class, so
+their panes differ by name.** It is not general, and this paragraph read as if it were: **methods
+with identical panes DID collide until 2026-10-11** - two Actor Framework methods carrying `ROOT in`,
+`error in`, `ROOT out`, `error out`, or methods of two different classes, since an export writes
+every class as bare `ref{UDClassInst}`, got ONE stub, and `lvai_swap_subvis`, which matches by VI
+name, could not tell their nodes apart. The signature now carries the TARGET's identity - its
+qualified name, else its full path - so every subject gets its own stub, and a second call for the
+same subject with an unchanged pane still reuses its own. Stubs cached under the old key stay in
+`user.lib\LV_MCP\` and are simply no longer chosen.
 
 So a generated method CAN read its own fields, and a real HAL is reachable: measured over four DAQmx
 methods that take only the class wire and the error cluster, `socketsLeft: 0` on all four. Choose the
@@ -2192,6 +2232,40 @@ them additionally inside Case frames — all six listed, five of five entries sw
 `Traverse Target` = 1 for the block diagram) walks the whole diagram; it hands back GObject
 references, so each needs `To More Specific Class` onto `ref{LV.SubVI}` before `VI Name` is read or
 `Replace` is invoked.
+
+**THE CONSTANTS HAD THE SAME BLIND SPOT FOR ANOTHER MONTH, and `constantsJson` reaches any depth as
+of 2026-10-11 - measured 2026-10-17 on both backends.** The class constants were still collected from
+the top-level diagram's `All Objects[]`, so a `path` seed nested in a Case frame inside a loop was
+never found. A second `Traverse for GObjects.vi` call collects them now; its `Class Name` is ONE
+labelled constant, `Constant Class Name` = `Constant`, because a string constant reports
+`StringConstant` and a class constant `LabVIEWClassConstant`, so whether the traversal answers
+`Constant` for every kind depends on whether it matches descendant classes - and it does: a probe
+of five constants (path, bool) answered `constantsSeen: 5`, and a seed nested in a Case frame in a
+loop came out a class constant. **A label that MORE
+THAN ONE constant carries is REFUSED** (the user's decision of 2026-10-11): it is not replaced,
+`constantsAmbiguous` names it with its count, `ok` is false with `errorKind:
+constantLabelAmbiguous`, and every label that matched exactly once is still replaced and saved. So
+name every seed constant `_name`-uniquely. `docs/class-method-tooling.md` "Constants at any depth".
+
+**A VI AT STATE 0 WITH A BROKEN-WIRE TEXT GETS REMOVE BAD WIRES BEFORE ANY REBUILD** - the user's
+rule of 2026-10-11. A `Replace` (subVI, constant, pane control) re-types the wires it can and leaves
+the rest BROKEN, and one broken wire is enough for `execState 0`; regenerating for that throws away
+the swaps, the binds and the icon to fix what `{LV.VI}` `BD.Remove Bad Wires` clears in one call.
+So `lvai_swap_subvis`, `lvai_bind_typedef_constants` and `lvai_add_class_method` end with it as a
+shared step, `removeBadWires` (default true), through `scripts/lvbd_remove_bad_wires.xml` in the
+IDE's instance with the project active. **It says exactly what went**: `badWireCleanup` lists every
+removed wire as `terminal @ owner -> terminal @ owner`, and every sink of a broken wire that HAD a
+source is read back - one with no wire afterwards is a lost connection (two sources on one input,
+a wrong-type source), named in `inputsLeftUnwired`, and the calling tool's `ok` turns false
+(`errorKind: badWireCleanupLostConnection`). A wire with no source is a loose fragment: cleared,
+reported, gates nothing. A VI with no broken wire is not touched or saved. Measured 2026-10-17 on
+BOTH backends through `lvai_swap_subvis` (the helper composed and run over ActiveX on `pylabview`):
+a `path` seed wired to a `path` indicator, swapped to a class constant, came back with the one
+broken wire removed, `inputsLeftUnwired` naming the indicator, `ok: false` with
+`badWireCleanupLostConnection`, the untouched wire beside it kept and `execStateAfter: 1`; a swap
+with no broken wire answered `brokenWires: 0`, not saved, `ok: true`. Through `lvai_add_class_method`
+and on a class member, where `Save.Instrument` alone may not persist the removal, it is NOT
+measured - read the method cold. `docs/class-method-tooling.md` "Clearing broken wires".
 
 **THE PYLABVIEW FALLBACK IS NOT AN ANSWER FOR THIS, and it fails LOUDLY only on the second look.**
 `pylv_apply {"op":"retarget"}` reaches a nested node — it edits link records and never walks a
@@ -2859,7 +2933,10 @@ literally it argued away 600 usable palette VIs.
 | How do I REMOVE / RENAME / CONVERT a DQMH event, rename a module, add an RT tester, drop Do Something, make a module TEMPLATE, or VALIDATE - with no dialog? | `docs/dqmh-scripting.md` §9d, §9e | `lvai_dqmh_remove_event`, `_rename_event`, `_convert_event`, `_rename_module`, `_create_rt_tester`, `_remove_do_something`, `_create_module_template`, `_validate_module` - each reports in `completionNeeded` what Delacor leaves for a person |
 | How do I put CODE into a DQMH message frame (the `#CodeNeeded` one)? | `docs/dqmh-scripting.md` §9h | `lvai_dqmh_place_handler` - a handler subVI whose terminals are NAMED after the event's argument and reply fields, wired by name; a Request and Wait for Reply frame leaves Main.vi not executable through its unwired Merge Errors input (VI Server names no cause - the user found it in the IDE), which the handler's error out fills |
 | How do I create a DQMH UNIT TEST, and which DQMH functions run without their dialog? | `docs/dqmh-scripting.md` §9, §9a | `lvai_dqmh_new_unit_test` - a generated wrapper calls Delacor's LOADED scripters; the test VI is `execState 0` by Delacor's design (`#CodeNeeded` frames) |
-| What is the ACTOR FRAMEWORK made of? | `docs/labview-actor-framework.md` | the actor half is `lvai_create_class` (parent `Actor.lvclass`) + `lvai_create_accessors` + `lvai_add_class_method` |
+| What is the ACTOR FRAMEWORK made of? | `docs/labview-actor-framework.md` | the actor half is `lvai_create_class` (parent `Actor.lvclass`) + `lvai_create_accessors` + `lvai_add_class_method` for its own methods; its lifecycle OVERRIDES come from `lvai_create_override`, never from `lvai_add_class_method` |
+| How do I override Pre Launch Init / Actor Core / Stop Core / Handle Error, and hook a body into it? | `docs/af-override-tools.md` | `lvai_create_override` (NI's provider places Call Parent, which AIXML cannot author), then `lvai_af_add_hook` (`branch`, `series`, `seriesAfter`, `branchFromNode`; refuses an unfed required input and a Handle Error hook before Call Parent), `lvai_af_remove_hook` to take one out - a series hook is BYPASSED (source reconnected to every sink) before the node goes, because a plain delete cuts the class wire and leaves the override eBad. Overrides come after the library and the messages |
+| How does an actor BEHAVE at run time - lifecycle, error 43 at Handle Error, helper-loop stop, error propagation? | `docs/labview-actor-framework.md` §19 | — each fact marked NI source / measured here / documented / reported |
+| How do I CREATE a library (`.lvlib`), and list a VI at TARGET level in a project? | `docs/library-creation.md` | `lvai_create_library` - NI's `Library.Create` + `Save`, the project entry, description and members in one call, both backends; `lvai_add_vis_to_project targetLevel=true` for a VI directly under My Computer (without it every VI goes into a folder) |
 | How do I put a class or VI INTO a `.lvlib`? | `docs/labview-actor-framework.md` §8 | `lvai_add_to_library` — NEVER write `NI.Lib.ContainingLib` by hand: it changes the class's QUALIFIED NAME without relinking the members that call each other by it, and every file-level check stays green while every VI goes `eBad`. NI's `{LV.Library}` `AddItem` + `Save All This Library.vi` writes both halves and relinks |
 | How do I create an Actor Framework MESSAGE? | `docs/labview-actor-framework.md` | `lvai_create_message_class` — NEVER author `Do.vi`: a GENERATED override of `Message.lvclass:Do.vi` is `eBad` whatever its diagram, measured down to a pass-through with zero nodes. The tool drives NI's own Message Maker instead |
 | How is a `.lvproj` structured? | `docs/lvproj-structure.md` | `lvai_lvproj_reference` |
@@ -2879,6 +2956,12 @@ literally it argued away 600 usable palette VIs.
 | How do I wire a USER EVENT's refnum onto the DYNAMIC EVENT terminal? | `docs/labview-vit-templates.md` §5a, `docs/vi-server-reference.md` | `lvai_wire_dynamic_events` — author the refnum into the structure as an ordinary TUNNEL first, so AIXML keeps the net |
 | How does the handler READ the user event's PAYLOAD? | `scripts/aixml-skeletons/user-event-two-loops.md`, `experiments/pylabview/event-data-fields/` (source tree only) | `lvai_set_event_data_fields` — third call of the route; author a labelled placeholder constant into a PRIM input first, and field index 4 is the first payload item |
 | How do I give a VI an icon? | `docs/vi-server-reference.md` | `lvai_set_vi_icon` |
+| Why do the class housekeeping tools refuse UNSAVED changes, and when is that switched off? | `docs/lvclass-creation.md` §10e | `checkUnsaved` on `lvai_set_class_description`, `lvai_move_to_folder`, `lvai_add_to_class`, `lvai_set_vi_descriptions` - default true, for an EXISTING project where someone may have VIs open; the user's rule of 2026-10-17: in a project this session builds itself, pass false |
+| How do I set a CLASS's or LIBRARY's DESCRIPTION? | `docs/lvclass-creation.md` §10a | `lvai_set_class_description` - project OPEN and ACTIVE; text outside CP1252 is refused before LabVIEW (it would be stored as `?` in silence), verified from the saved `NI.Lib.Description` |
+| How do I put class or library members into a VIRTUAL FOLDER, or create one? | `docs/lvclass-creation.md` §10b | `lvai_move_to_folder` - project OPEN and ACTIVE; only the owner file changes (no file move, no relink); non-members, accessors inside a property definition and nested paths are refused from the file; verified from the saved owner |
+| How do I change VI DESCRIPTIONS without regenerating the VIs (icons kept)? | `docs/lvclass-creation.md` §10c | `lvai_set_vi_descriptions` - many VIs in one call, project CLOSED, `VI Description` + `Save.Instrument`; CP1252 refused up front, verified per VI from the saved STRG resource and an unchanged icon |
+| How do I put an existing `.ctl` or VI INTO a class, and keep its callers linked? | `docs/lvclass-creation.md` §10d | `lvai_add_to_class` - a typedef is RENAMED by the add and only LOADED callers relink, so pass the callers outside the class in `callerPaths`; an offline link scan refuses a missed one; only listed callers are saved; verified from the class file and each item's LIBN |
+| How do I give a CLASS or LIBRARY an icon, push it onto the members, or check icons by read-back? | `docs/class-icons.md` | both backends; a class's or library's icon is read through LabVIEW ONCE and cached, keyed on its file's `NI.Lib.Icon` line (§7) - `lvai_set_owner_icon` (project closed; saves each member, codes per member), `lvai_read_icons` (pixel compare; LabVIEW writes no PNG into a missing folder or past MAX_PATH and answers 0), `lvai_set_vi_icon keepOwnLayer` (template only, no flattening; unmeasured) |
 | How do I keep a SUPPLIED front panel (exam template, customer panel) and still generate the code? | `docs/keep-supplied-front-panel.md` | `lvai_graft_diagram` — generate the program as a SCAFFOLD with the panel's own labels and types, then graft; a supplied diagram with code is refused unless `replaceDiagram` (the old code is discarded). NEW controls: `allowNewControls`, placed by LabVIEW, layout by hand |
 | How do I get a BOUND reference to a control AIXML cannot create - a Web Browser control? | `docs/keep-supplied-front-panel.md` §6g, `docs/aixml-reference.md` §8 | `lvai_bind_control_references` — author against a `ref{LV.WebBrowser}` stand-in, graft into the panel with the real control, then bind. For a control AIXML CAN create, write `<Node _name="VI Server Reference" element="<label>"/>` directly |
 | How do I put Nigel into DISCUSS mode on a VI or project? | `docs/aixml-reference.md` §14 | `lvai_discuss_file` |
@@ -2931,7 +3014,7 @@ literally it argued away 600 usable palette VIs.
 | Is what is PUBLISHED actually the workflow's artefact? | `docs/release-versioning.md` §2a, §2b | `scripts/Assert-PublishedRelease.ps1` |
 | How do I generate a VI in one call? | `docs/bulk-operations.md` | `lvai_generate_vi` |
 | How do I run a whole pylabview edit in one call? | `docs/bulk-operations.md` | `pylv_apply` |
-| A pylabview-edited VI returns a WRONG result with no error, or crashes 64-bit LabVIEW | `docs/pylabview-stale-compiled-code.md` | `pylv_apply` strips the compiled code since 2026-09-29; grep the file for `VICD` |
+| A pylabview-edited VI returns a WRONG result with no error, or crashes 64-bit LabVIEW | `docs/pylabview-stale-compiled-code.md` | `pylv_apply` strips the compiled code since 2026-09-29. Check a file by its OWN resource map (`RsrcMap.Lists`), NOT a byte grep for `VICD`: a VI that embeds a malleable VI carries the instance's VICD inside its VINS block - an AF message's `Do.vi` does, and a grep called two source-only `Do.vi` compiled on 2026-10-17 |
 | When is pylabview the route, not AIXML? | `experiments/pylabview/ROUTING.md` (source tree only) | `pylv_route` |
 | How much of a codebase is outside AIXML? | `docs/aixml-gap-census.md` | — |
 | Where does a session's time actually go, and what should we build next? | `docs/workflow-economics.md` | — |
@@ -2956,6 +3039,7 @@ literally it argued away 600 usable palette VIs.
 | How do I put a diagram comment WHERE I MEAN? | `docs/diagram-comments.md` | `scripts/pylv-place-labels.py` |
 | How do I LOOK at a diagram I just changed? | `docs/diagram-comments.md` | `lvai_render_diagrams` |
 | How do I check that an event-driven VI REACTS, not just that it starts? | `docs/cold-build-atm-agents-7.md` | `lvai_run_vi_and_read_values` `runForMs` + `signalsJson` |
+| What does LabVIEW look like from OUTSIDE - processes, dialogs, unsaved windows - and which VIs in memory carry UNSAVED changes, in which application instance? | `docs/labview-state.md` | `lvai_labview_state` (no LabVIEW call, a screenshot per possible dialog), `lvai_vis_in_memory` (`context` main / project / addon / all - a VI lives in ONE instance, and the fork read only NI's add-on's) |
 | WHY is a VI broken - what does LabVIEW's Error List say? | `docs/error-list.md` | `errors` in every executability answer (`lvai_exec_state`, `lvai_generate_vi`'s `execState` step, the test generators, `lvai_convert_aixml_to_vi`) - the Error List's own lines for that VI, read from disk; `lvai_error_list` for every broken VI IN MEMORY, main instance and the active project's, run over ActiveX because through NI's service it sees the addon's instance and answers an EMPTY list |
 | Why does a consumer loop act on stale panel values? | `docs/cold-build-atm-agents-7.md` | `lvai_check_aixml` `controlReadBeforeWait` |
 | Why does LabVIEW's exit ask to save dozens of `LVMCP Validate` VIs, or the Error list show them, and can they be closed? | `docs/scratch-vis-in-memory.md` §2a | — safe to discard; the fixed name still piles up as `LVMCP Validate2` … `12`, and their windows and dialogs can report themselves invisible |
@@ -3102,7 +3186,11 @@ powershell -ExecutionPolicy Bypass -File .githooks/run-tests.ps1
 
 Use the second one rather than a bare `dotnet test`: a running MCP server holds an OS lock on the
 exe, and the script stops it first. After either command the `lvai_*` tools are gone from the
-current session until the client is restarted — nothing is lost, but plan the restart.
+current session until the client is restarted — nothing is lost, but plan the restart. **That
+holds only for a server running from THIS tree's `src\LabVIEWMCP\bin`**: both scripts stop no
+other, so an installed plugin, or a server built in another worktree, keeps running. Until
+2026-10-10 both stopped every `LabVIEWMCP` on the machine, which killed a plugin serving another
+session.
 
 **THE PRE-PUSH GATE USED TO TEST THE WRONG TREE FROM A WORKTREE, and reported PASS for it.**
 Measured 2026-09-11. `run-tests.ps1` derived the tree under test from its own location, and
