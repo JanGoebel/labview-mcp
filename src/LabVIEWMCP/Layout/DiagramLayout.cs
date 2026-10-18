@@ -81,6 +81,8 @@ internal static class DiagramLayout
     /// <summary>Extra inset where a structure inside sits against the border: room for a wire
     /// between its ports and ours to run up or down.</summary>
     public const int Lane = 14;
+    /// <summary>How far a constant hanging left of a node stays off the row of an input a wire feeds.</summary>
+    public const int WireClear = 6;
     /// <summary>Extra width a gap between columns gets per wire crossing it beyond the second.</summary>
     public const int WireLane = 6;
     /// <summary>How far a constant may rise above its terminal to let its node move left. With no
@@ -149,6 +151,9 @@ internal static class DiagramLayout
         public int PortTop;               // where ports may start on the side borders: room
                                           // added for them goes between this and Top
         public int Left;
+        /// <summary>Per frame, how far right of <see cref="Left"/> its contents start: an event
+        /// frame's code begins right of its own data node.</summary>
+        public Dictionary<Diagram, int> FrameDx { get; } = [];
         public Dictionary<Diagram, (Arrangement A, int Dy)> Frames { get; } = [];
         public List<Port> Ports { get; } = [];
         public bool Opaque;
@@ -296,7 +301,9 @@ internal static class DiagramLayout
         var blocks = new Dictionary<DObject, Block>();
         foreach (var n in layoutNodes)
             blocks[n] = MakeBlock(ctx, n, attached.GetValueOrDefault(n), anchored.GetValueOrDefault(n),
-                                  onRail: d.Owner is not null && mainChain.Contains(n) && RailOffset(ctx, n, graph) is not null);
+                                  onRail: d.Owner is not null && mainChain.Contains(n) && RailOffset(ctx, n, graph) is not null,
+                                  wired: graph.In(n).Where(e => e.From != n && !e.From.IsConstant && e.ToTerm is not null)
+                                                    .Select(e => e.ToTerm!).ToList());
 
         // ---- columns
         var layer = Layers(graph, layoutNodes, isTop);
@@ -347,7 +354,10 @@ internal static class DiagramLayout
         int Lanes(int i)
         {
             var crossing = nets.Count(g => colOf[g.Key.From] <= i && g.Any(e => colOf[e.To] > i))
-                + colOf.Where(kv => kv.Value > i).Sum(kv => graph.LeftFed.GetValueOrDefault(kv.Key))
+                // per WIRE from the left border, not per node it feeds: DQMH's Initialize frame
+                // fans its queue and admin refnums out to many nodes, and counted per node they
+                // reserved 140 px of lanes left of the code (ATM_DQMH_Cold, 2026-10-18)
+                + graph.LeftWires.Count(w => w.Any(k => colOf.TryGetValue(k, out var c) && c > i))
                 + colOf.Where(kv => kv.Value <= i).Sum(kv => graph.RightFed.GetValueOrDefault(kv.Key));
             return WireLane * Math.Max(0, crossing - 2);
         }
@@ -406,10 +416,13 @@ internal static class DiagramLayout
         }
 
         if (band is not null && colPlans.Count > 1)
+        {
             BandRows(colPlans, blocks, band, a.Pos, anyRail ? railY : null,
                      layoutNodes.Where(n => n.IsConstant && graph.Out(n).Select(e => e.To).Where(t => t != n).Distinct().Count() >= 2).ToHashSet());
+        }
         else if (colPlans.Count > 1)
             AlignToNeighbours(ctx, graph, colPlans, blocks, a.Pos, anyRail ? railY : null);
+        if (colPlans.Count > 1) TreeRows(ctx, graph, colPlans, blocks, a.Pos, anyRail ? railY : null);
 
         // ---- compaction: a node moves left as far as nothing beside it and no wire into it
         // forbids. Columns alone kept the ATM's Init ATM Panel 300 px to the right, across empty
@@ -499,7 +512,11 @@ internal static class DiagramLayout
                     var xNode = own.Aggregate(PredX(n, c), (x, p) => Math.Max(x, Clear(p.B, py, true, c, int.MinValue)));
                     var xFull = held.Aggregate(xNode, (x, p) => Math.Max(x, Clear(p.B, py, false, c, int.MinValue)));
                     var nx = xFull;
-                    if (xFull - xNode > ColumnGap && held.Count > 0)
+                    // ONE constant rises: the staircase is for a chain of subVIs with a long
+                    // constant each. Several - an Index Array's indices - feed terminals 8 px apart,
+                    // and lifted together over the node Find Account's three column constants
+                    // dropped their wires into an 18 px gap that LabVIEW knotted (2026-10-18)
+                    if (xFull - xNode > ColumnGap && held.Count == 1)
                     {
                         for (var lift = 4; lift <= MaxLift; lift += 4)
                         {
@@ -635,6 +652,38 @@ internal static class DiagramLayout
                           B: ((double)a.Pos[e.To].X, (double)a.Pos[e.To].Y + TermY(ctx, e.To, e.ToTerm)),
                           (object)e.From, (object)e.To)).ToList();
         score = (OrthogonalCrossings(dataWires), dataWires.Sum(w => Math.Abs(w.A.Item2 - w.B.Item2)));
+
+        // a comment never becomes the leftmost thing on the diagram: the arrangement starts at its
+        // leftmost object, so a comment hanging further left than any code moved ALL the code right
+        // behind empty diagram - 172 px in DQMH's Initialize frame. Slid right to where the code
+        // starts, at the nearest height where it lands on nothing - level with where it was it
+        // touched the Initialize frame's Initial Message constant 4 px above it
+        var codeBoxes = a.Pos.Where(kv => !kv.Key.IsText).Select(kv => Extent(ctx, kv.Key, kv.Value.X, kv.Value.Y)).ToList();
+        if (codeBoxes.Count > 0)
+        {
+            var codeL = codeBoxes.Min(b => b.L);
+            foreach (var t in a.Pos.Keys.Where(o => o.IsText && !a.Notes.Contains(o)).ToList())
+            {
+                var e = Extent(ctx, t, a.Pos[t].X, a.Pos[t].Y);
+                if (e.L >= codeL) continue;
+                var others = a.Pos.Where(kv => kv.Key != t).Select(kv => Extent(ctx, kv.Key, kv.Value.X, kv.Value.Y)).ToList();
+                int? found = null;
+                for (var k = 0; k <= 40 && found is null; k++)
+                {
+                    var dy = (k % 2 == 0 ? 1 : -1) * ((k + 1) / 2) * 4;
+                    if (!others.Any(b => b.Overlaps(e.Offset(codeL - e.L, dy), LabelGap))) found = dy;
+                }
+                // the code is dense there: above all of it, which costs a line of height where
+                // staying put cost the comment's width - 142 px in the Initialize frame
+                if (found is null)
+                {
+                    var top = others.Min(b => b.T);
+                    for (var y = top - e.H - LabelGap; found is null && y > top - 400; y -= 4)
+                        if (!others.Any(b => b.Overlaps(e.Offset(codeL - e.L, y - e.T), LabelGap))) found = y - e.T;
+                }
+                if (found is { } fy) a.Pos[t] = (a.Pos[t].X + codeL - e.L, a.Pos[t].Y + fy);
+            }
+        }
 
         // normalise to (0,0)
         var boxes = a.Pos.Select(kv => Extent(ctx, kv.Key, kv.Value.X, kv.Value.Y)).ToList();
@@ -797,10 +846,12 @@ internal static class DiagramLayout
             contentW = Math.Max(contentW, a.W);
         }
         FitNotes(ctx, shape, ref contentW, ref contentH, ref rail);
-        // an event frame's data node sits on the left border: the contents start right of it
-        var dataNode = s.Frames.SelectMany(f => f.Objects.Where(o => IsBorderNode(f, o) && IsEventDataNode(o)))
-                               .Select(o => o.Box.R - s.Box.L).DefaultIfEmpty(0).Max();
-        if (dataNode > 0) il = Math.Max(il, dataNode + ColumnGap / 2);
+        // an event frame's data node sits on the left border: THAT frame's contents start right of
+        // it. Taken over all frames, the widest data node of DQMH's Main (149 px, Stop Module's
+        // event) pushed the code of all twelve frames 191 px in, the narrowest data node 39 px
+        var dataNode = s.Frames.ToDictionary(f => f, f => f.Objects
+            .Where(o => IsBorderNode(f, o) && IsEventDataNode(o))
+            .Select(o => o.Box.R - s.Box.L + ColumnGap / 2).DefaultIfEmpty(0).Max());
         // a lane between a structure inside and this border, where a wire from its port to ours
         // runs up or down: with the plain inset that lane was 7 px wide, and CleanUpWire routed the
         // event loop's error wire backwards round its corner to get down it
@@ -810,18 +861,28 @@ internal static class DiagramLayout
         if (StructureAt(b => b.L <= 0)) il += Lane;
         if (StructureAt(b => b.R >= cw)) ir += Lane;
         shape.Left = il;
+        var used = il + contentW;
+        foreach (var (f, (a, _)) in shape.Frames)
+        {
+            if (dataNode[f] <= il) continue;
+            shape.FrameDx[f] = dataNode[f] - il;
+            var right = a.Pos.Select(kv => Extent(ctx, kv.Key, kv.Value.X, kv.Value.Y).R).DefaultIfEmpty(0).Max();
+            used = Math.Max(used, dataNode[f] + right);
+        }
         shape.Top = it + labelH;
         shape.PortTop = shape.Top;
         var labels = s.Frames.SelectMany(f => SubdiagramLabels(f, s)).ToList();
         var labelW = labels.Select(t => t.Box.W).DefaultIfEmpty(0).Max();
-        shape.W = Math.Max(Math.Max(il + contentW + ir, 60), Math.Min(labelW, SubdiagramLabelKeep) + (s.Box.W - labelW > 0 && s.Box.W - labelW < 40 ? s.Box.W - labelW : 12));
+        shape.W = Math.Max(Math.Max(used + ir, 60), Math.Min(labelW, SubdiagramLabelKeep) + (s.Box.W - labelW > 0 && s.Box.W - labelW < 40 ? s.Box.W - labelW : 12));
         // a label whose TEXT the dump read is as wide as its text: NI's converter sizes a
         // structure to its contents and clips the label - "Append one line per" of "Append one
         // line per channel" (the gRPC cold build of LayoutCheck, 2026-10-16) - and LabVIEW widens
-        // the label with the structure, measured. The box alone carried only the clipped width
-        var textW = labels.Where(t => t.Text is not null)
-            .Select(t => TextMetrics.Lines(t.Text!).Max(l => TextMetrics.Width(l)) + LabelTextPad)
-            .DefaultIfEmpty(0).Max();
+        // the label with the structure, measured. The box alone carried only the clipped width.
+        // A label taller than one line WRAPS its text: it needs only the width at which the text
+        // fits the lines its box holds. Measured as if on one line, Delacor's six-line notes in
+        // DQMH's Main and Stop Module widened their cases to ~500 px, and the empty band their old
+        // height left above the code made Stop Module 3081 px wide against 1600 (2026-10-18)
+        var textW = labels.Where(t => t.Text is not null).Select(LabelWidth).DefaultIfEmpty(0).Max();
         shape.W = Math.Max(shape.W, Math.Min(textW, SubdiagramLabelMax));
         shape.H = Math.Max(shape.Top + contentH + ib, 50);
         shape.Rail = rail >= 0 ? shape.Top + rail : null;
@@ -841,6 +902,20 @@ internal static class DiagramLayout
         }
         Ports(ctx, s, shape, ib);
         return shape;
+    }
+
+    /// <summary>The width a subdiagram label needs to show its text in the lines its box holds:
+    /// on one line for a one-line label, else the narrowest width (from its own box up) at which
+    /// the wrapped text fits.</summary>
+    internal static int LabelWidth(DObject t)
+    {
+        var text = t.Text!;
+        var oneLine = TextMetrics.Lines(text).Max(l => TextMetrics.Width(l)) + LabelTextPad;
+        var capacity = Math.Max(1, t.Box.H / TextMetrics.LineHeight);
+        if (capacity == 1) return oneLine;
+        for (var w = Math.Max(t.Box.W, 2 * LabelTextPad); w < oneLine && w < SubdiagramLabelMax; w += 8)
+            if (TextMetrics.WrappedLines(text, w - LabelTextPad) <= capacity) return w;
+        return Math.Min(oneLine, SubdiagramLabelMax);
     }
 
     /// <summary>
@@ -1303,13 +1378,18 @@ internal static class DiagramLayout
         public List<(DObject O, int Dx, int Dy)> Members { get; } = [];
     }
 
-    private static Block MakeBlock(Context ctx, DObject n, List<(DObject C, Term? To)>? constants, List<DObject>? labels, bool onRail = false)
+    private static Block MakeBlock(Context ctx, DObject n, List<(DObject C, Term? To)>? constants, List<DObject>? labels,
+                                   bool onRail = false, List<Term>? wired = null)
     {
         var (w, h) = Size(ctx, n);
         var block = new Block();
         // the node's own label (DQMH_REG_EVENTS above a node) takes room too
         var (oL, oT, oR, oB) = n.Overhang;
         var parts = new List<Box> { new(-oL, -oT, w + oL + oR, h + oT + oB) };
+        // a label ABOVE or BELOW the node takes no column width: it stays an obstacle (Box) but
+        // the next column may start beside it, where Find Account's indicators stood 118 px right
+        // of "Fract/Exp String To Number" for nothing but its label
+        var widthParts = new List<Box> { oT > 0 || oB > 0 ? new Box(0, -oT, w, h + oT + oB) : parts[0] };
         var wanted = new List<(DObject C, Box B, int L, int T)>();
         foreach (var (c, to) in constants ?? new List<(DObject C, Term? To)>())
         {
@@ -1333,19 +1413,55 @@ internal static class DiagramLayout
             prevBottom = b.B;
         }
         var lift = stacked.Count == 0 ? 0 : (stacked.Sum(x => x.B.T) - wanted.Sum(x => x.B.T)) / stacked.Count;
+        // the stack keeps the rows of the node's OTHER inputs clear, those a wire feeds: an
+        // assert's Label constant, stacked under its Expected, sat on the rows of Actual and of
+        // error in, and the error fan-out from Define Test came in from above and turned 25 px
+        // back into every assert of Test Find Account (2026-10-18). Lifted above them instead.
+        // Not on a structure: its border is ports, which Ports places - lifted, the ATM command
+        // loop's shift-register constants stood over the loop with two wires turning back
+        var rows = (wired ?? []).Select(t => (T: t.Box.T - n.Box.T, B: t.Box.B - n.Box.T)).ToList();
+        if (!n.IsStructure && stacked.Count > 0 && rows.Count > 0)
+        {
+            bool Covers(int dl) => stacked.Any(x => rows.Any(r => x.B.T - dl < r.B + WireClear && x.B.B - dl > r.T - WireClear));
+            if (Covers(lift))
+            {
+                // above the wired rows or below them, whichever is the shorter way: an Index
+                // Array's index constants belong UNDER its wired array input - lifted over the
+                // node, Find Account's three column constants dropped into an 18 px gap and
+                // LabVIEW knotted their wires (the user's review, 2026-10-18)
+                var up = stacked.Max(x => x.B.B) - (rows.Min(r => r.T) - WireClear);
+                var down = stacked.Min(x => x.B.T) - (rows.Max(r => r.B) + WireClear);
+                var options = new[] { up, down }.Where(v => !Covers(v)).OrderBy(v => Math.Abs(v - lift)).ToList();
+                if (options.Count > 0) lift = options[0];
+            }
+        }
         foreach (var (c, b0, cL, cT) in stacked)
         {
             var cb = b0.Offset(0, -lift);
             parts.Add(cb);
+            widthParts.Add(cb);
             block.Members.Add((c, cb.L + cL, cb.T + cT));
         }
-        block.WidthBox = Box.Union(parts);
+        block.WidthBox = Box.Union(widthParts);
         foreach (var t in labels ?? new List<DObject>())
         {
             var (dx, dy) = LabelOffset(t, n, w, h);
             // in a frame nothing hangs below the rail: there it would make every frame of the
             // structure taller by its height, since all frames share one size and one rail
             if (onRail && dy >= h) dy = -t.Box.H - LabelGap;
+            // a comment never reaches LEFT of its block: kept as far left of its node as it sat,
+            // Delacor's "#CodeNeeded - Initialize your state data here." hung 180 px out and held
+            // every node of the Initialize frame that far right of empty diagram (the user's review
+            // of ATM_DQMH_Cold, 2026-10-18). Pulled in, it goes above its node, or below a subVI.
+            // Only a comment BESIDE its node: one above or below may still reach left - Delacor's
+            // long note under Synchronize Caller Events' case, pulled right, made it 1144 px wide
+            // against 791, over diagram it held nothing back on
+            if (dx < block.WidthBox.L && dy > -t.Box.H && dy < h)
+            {
+                dx = block.WidthBox.L;
+                dy = n.Class is "SubVI" or "DynamicDispatchSubVI" or "PolymorphicSubVI" && !onRail
+                    ? h + LabelGap : -t.Box.H - LabelGap;
+            }
             var lb = new Box(dx, dy, t.Box.W, t.Box.H);
             parts.Add(lb);
             block.Members.Add((t, dx, dy));
@@ -1561,7 +1677,7 @@ internal static class DiagramLayout
                 var dH = o.FrameSize is { } fs2 ? o.Box.H - fs2.H : 0;
                 ctx.Plan.Sizes.Add(new LayoutSize(d.Id, d.ApplyPath, o.Index, shape.W - dW, shape.H - dH, d.Depth, box));
                 foreach (var (f, (fa, fdy)) in shape.Frames)
-                    Place(ctx, f, fa, x + shape.Left, y + shape.Top, fdy);
+                    Place(ctx, f, fa, x + shape.Left + shape.FrameDx.GetValueOrDefault(f), y + shape.Top, fdy);
                 PlaceLoopTerminals(ctx, o, box);
                 foreach (var port in shape.Ports)
                     ctx.Plan.Tunnels.Add(new LayoutTunnel(d.ApplyPath, o.Index, port.Index,
@@ -1611,6 +1727,9 @@ internal static class DiagramLayout
         /// RIGHT border: they cross every gap between the border and the node.</summary>
         public Dictionary<DObject, int> LeftFed { get; } = [];
         public Dictionary<DObject, int> RightFed { get; } = [];
+        /// <summary>Per wire from the frame's LEFT border, the nodes it feeds: a fan-out takes ONE
+        /// lane across a gap, however many nodes beyond it hang on its branches.</summary>
+        public List<HashSet<DObject>> LeftWires { get; } = [];
 
         /// <summary>
         /// The error chain the rail carries: the one that enters or leaves by the border, else the
@@ -1679,9 +1798,12 @@ internal static class DiagramLayout
                     : e.O is { } o && !e.Source && !nodes.Contains(o) && !o.IsText && !o.IsDecoration
                       && (o.IsLoopTerminal || d.Owner is { } ow && o.Box.L > ow.Box.L + ow.Box.W / 2);
                 if (s.Border && s.Source)
-                    foreach (var k in ends.Where((e, i) => i != src && !e.Border && e.O is not null && nodes.Contains(e.O))
-                                          .Select(e => e.O!).Distinct())
-                        g.LeftFed[k] = g.LeftFed.GetValueOrDefault(k) + 1;
+                {
+                    var fed = ends.Where((e, i) => i != src && !e.Border && e.O is not null && nodes.Contains(e.O))
+                                  .Select(e => e.O!).ToHashSet();
+                    foreach (var k in fed) g.LeftFed[k] = g.LeftFed.GetValueOrDefault(k) + 1;
+                    if (fed.Count > 0) g.LeftWires.Add(fed);
+                }
                 if (s.O is not null && nodes.Contains(s.O) && ends.Where((_, i) => i != src).Any(e => e.Border && !e.Source))
                     g.RightFed[s.O] = g.RightFed.GetValueOrDefault(s.O) + 1;
                 if (s.O is not null && nodes.Contains(s.O) && ends.Where((_, i) => i != src).Any(RightSink))
@@ -1737,7 +1859,7 @@ internal static class DiagramLayout
             {
                 var x = stack.Pop();
                 group.Add(x);
-                foreach (var e in g.Out(x).Concat(g.In(x)).Where(e => !e.Error))
+                foreach (var e in g.Out(x).Concat(g.In(x)).Where(e => !e.Error || ReadsErrorAsData(e)))
                     foreach (var y in new[] { e.From, e.To })
                         if (set.Contains(y) && seen.Add(y)) stack.Push(y);
             }
@@ -1753,6 +1875,15 @@ internal static class DiagramLayout
             foreach (var n in ranked[i]) band[n] = i;
         return band;
     }
+
+    /// <summary>
+    /// An error cluster wired into a NAMED input that is not an error input - `Unbundle By Name`'s
+    /// `input cluster`, to assert the code - is data the case reads, not the chain passing on.
+    /// Counted as error, it split such a case in two: IfaceUE_TDMS3's method test (2026-10-18) put
+    /// the class constant and `Open` at the bottom and the unbundle and its Assert at the top.
+    /// </summary>
+    private static bool ReadsErrorAsData(Edge e) =>
+        e.ToTerm is { Name.Length: > 0 } t && !IsError(t.Name) && e.From != e.To;
 
     /// <summary>
     /// The heights of a diagram made of bands: each band one row across the columns - its nodes'
@@ -1833,6 +1964,55 @@ internal static class DiagramLayout
                 foreach (var (n, y) in nodes) pos[n] = (pos[n].X, y + dy);
                 y0 = bottom + dy + RowGap;
             }
+        }
+    }
+
+    /// <summary>
+    /// What collects the bands' errors - a Caraya test's tree of Merge Errors - sits at the height
+    /// of what it collects, column by column: each node centred on its inputs, the next level on
+    /// those. Stacked from the rail up instead, the first-level merges of Test Find Account sat at
+    /// y 618-828 under asserts spread from 52 to 809; twelve error wires ran up to 570 px down a
+    /// 100 px gap, and LabVIEW took ten of them past the merges and 25 px back (2026-10-18).
+    /// The node on the rail stays there, and a column is moved only when everything above its rail
+    /// is such a collector.
+    /// </summary>
+    private static void TreeRows(Context ctx, Graph g, List<(List<DObject> Above, DObject? OnRail)> cols,
+                                 Dictionary<DObject, Block> blocks, Dictionary<DObject, (int X, int Y)> pos, int? railY)
+    {
+        // a pure error collector: two inputs or more, every one an error wire
+        bool Collector(DObject n)
+        {
+            var ins = g.In(n).Where(e => e.From != n).ToList();
+            return ins.Count >= 2 && ins.All(e => e.Error) && g.Out(n).All(e => e.Error);
+        }
+        for (var c = 0; c < cols.Count; c++)
+        {
+            if (cols[c].Above.Count == 0 || !cols[c].Above.All(Collector)) continue;
+            var movers = cols[c].Above;
+            var wanted = new List<(DObject N, int Top)>();
+            foreach (var n in movers)
+            {
+                var ins = g.In(n).Where(e => e.From != n && pos.ContainsKey(e.From) && !e.From.IsConstant).ToList();
+                if (ins.Count == 0) { wanted.Clear(); break; }
+                var mid = (int)ins.Average(e => pos[e.From].Y + TermY(ctx, e.From, e.FromTerm));
+                var meet = (int)ins.Average(e => TermY(ctx, n, e.ToTerm));
+                wanted.Add((n, mid - meet));
+            }
+            if (wanted.Count == 0) continue;
+            // in order, without overlap, and clear above the rail's node of this column
+            var placed = new List<(DObject N, int Top)>();
+            var prevBottom = int.MinValue / 2;
+            foreach (var (n, top0) in wanted.OrderBy(w => w.Top))
+            {
+                var b = blocks[n].Box;
+                var top = Math.Max(top0, prevBottom + RowGap - b.T);
+                placed.Add((n, top));
+                prevBottom = top + b.B;
+            }
+            var limit = cols[c].OnRail is { } onRail ? pos[onRail].Y + blocks[onRail].Box.T - RowGap
+                      : railY is { } ry ? ry - RowGap : int.MaxValue;
+            var excess = Math.Max(0, prevBottom - limit);
+            foreach (var (n, top) in placed) pos[n] = (pos[n].X, top - excess);
         }
     }
 

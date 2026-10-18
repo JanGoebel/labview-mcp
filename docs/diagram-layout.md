@@ -520,3 +520,263 @@ the generators.
   constant beside it.
 - The error wires still climb from the rail to each band's Assert.
 
+
+### 6a. A case that asserts an error code, 2026-10-18
+
+**Symptom.** The user's review of `IfaceUE_TDMS3\Tests\TDMS Logger\Test TDMS Logger Methods.vi`:
+some class constants sat far from the Assert they belong to. In the case `Open creates file without
+error (error code)`, the class constant and `Open` were at the bottom of the diagram and the
+`Unbundle By Name` and the Assert were at the top, 520 px apart. NI's Clean Up did better on that VI.
+
+**Cause.** A band is one connected component of the DATA wires (`Bands`). Such a case reads `Open`'s
+`error out` through `Unbundle By Name` -> `code` into the Assert's `Actual`. That wire has an
+error-named end, so it counted as part of the error chain, and the case fell apart into two bands.
+`Group Name survives Close (error code)` split the same way at `Close`.
+
+**Rule.** For the bands, an edge counts as data when an error cluster runs into a NAMED input that
+is not an error input, such as `input cluster` (`ReadsErrorAsData`). The rail is untouched: the rule
+applies only to band connectivity.
+
+**Measured.**
+
+- The plan for the dump `test-tdms-logger-methods-ours.txt` (the VI as our layout had left it) puts
+  each class constant within 120 px of the Assert it feeds. Before the fix it was 471 px for case 1.
+  It has 0 data crossings and no backward wire.
+- Every other layout fixture keeps its plan, move for move. 72 of 72 layout tests pass.
+- Live on a copy of the VI (pylabview backend, the branch build driven through
+  `scripts/mcp_drive.py`): 38 of 38 objects landed where planned, the diagram went from 1134 x 717
+  to 1134 x 624 px, and `execState` stayed 1.
+- `Test TDMS Logger.vi`, which has no error-code case, came out unchanged.
+
+**Still open:**
+
+- The error fan-out from `Define Test` into every Assert climbs from the rail in vertical trunks
+  that cross the bands. LabVIEW's wire clean-up places them, and NI's Clean Up shows the same.
+- A `written` constant that feeds both the Write and the Assert sits under its band at the far
+  left, so its wire to the Assert's `Expected` runs across the whole band.
+
+### 6b. Delacor's own VIs in a DQMH module, 2026-10-18
+
+**Symptom.** Laid out together with the whole of `C:\Temp\ATM_DQMH_Cold`, the Bank module's VIs
+grew. `Main.vi` went from 1344 x 805 to 2530 x 1143 px, `Stop Module.vi` from 1604 to 3081 px wide,
+`Test Bank API.vi` from 1295 to 1896 px. The frames showed large empty fields. All 76 VIs stayed
+executable and every object landed where planned, so nothing but the picture showed it.
+
+**Cause 1: a multi-line subdiagram label was measured as one line.** Delacor documents frames
+with subdiagram labels of up to six lines. One example is "User specified a timeout of -1, so don't
+wait ..." at 132 x 97 in a case 176 px wide. The rule that widens a structure to its label's text
+(written for a one-line label NI's converter had clipped) took the 96 characters as one line. The
+case was planned 502 px wide around 161 px of code. Its old six-line height was also kept as the
+label band, so LabVIEW re-wrapped the label into fewer lines and left an empty field above the code.
+Now a label holds `height / 15` lines, and the structure widens only until the word-wrapped text
+fits those lines (`DiagramLayout.LabelWidth`, `TextMetrics.WrappedLines`). A one-line label behaves
+as before. That case went from 502 to 209 px.
+
+**Cause 2: one left inset for every event frame.** The code of an event frame starts right of its
+Event Data Node. The inset was taken over ALL frames, so the widest data node (149 px, the Stop
+Module event) pushed the code of all twelve frames 191 px in. Each frame now starts right of its
+own data node (`StructShape.FrameDx`). Frame 7's code went from 212 to 88 px in.
+
+**Measured.** Re-applied live to the five enlarged VIs: Main 2530 -> 2289 px, Stop Module
+3081 -> 2756 px, Test Bank API 1896 -> 1813 px, Init Module 235 -> 165 px high. All five stayed
+executable, and every object landed where planned. Fixtures `dqmh-bank-main-original.txt` and
+`dqmh-bank-stop-module-original.txt`, tests in `LayoutDqmhFrameworkTests`.
+
+**Cause 3: a comment became the leftmost object of its diagram** (the user's review the same
+day). An arrangement starts at its leftmost object. Delacor's "#CodeNeeded - Initialize your state
+data here." kept its old offset left of its node, so the code of the message loop's Initialize
+frame started 172 px right of the border, behind empty diagram.
+
+Three guesses were wrong before a measurement settled it, which is worth recording:
+
+- Clamping the comment to its node's block helped only while the comment sat BESIDE its node. It
+  stood below, so it changed nothing there, and it made `Synchronize Caller Events.vi` 1144 px wide
+  against 791 by pulling a long note right that held nothing back.
+- The lanes reserved for wires from the frame's left border were the next suspect. They were
+  counted per fed node instead of per wire, which is wrong and is fixed (`Graph.LeftWires`), but
+  it was not the cause here.
+- Logging the arrangement before normalisation showed it: the comment at x = -142, the code at 0,
+  and no free spot for it within 80 px in the dense code column.
+
+Now a comment hanging left of all code slides to where the code starts, at the nearest free
+height, and above all code when there is none. A comment beside its node is still pulled above
+it, or below a subVI. The Initialize frame's code starts 30 px in. Main.vi is planned
+2228 x 1176 px (2289 x 1143 before).
+
+**Backward wires in `Find Account.vi` were a COMPOSER defect, not a layout one.** Its Index Array
+reads three columns, and the composer had put all three index inputs on one pin. Fixed in
+`aixml2vi.py` (`docs/aixml-backends.md`). A VI composed before the fix keeps the collapsed node
+until it is recomposed or patched.
+
+**Still open, and these are the larger part:**
+
+- **Data-flow columns against Delacor's two-dimensional packing.** In the message loop's
+  `Initialize` frame, Delacor stacks independent property and invoke nodes into 497 px. The engine
+  gives each data-flow stage a column and needs 761 px. Stop Module's chain through four nested
+  cases is the same at every level.
+- **A comment with an ARROW to a node.** Delacor's "If the module isn't running anymore ..." points
+  at the node it explains. The comment moves, the arrow stays attached to the node, and the result
+  is a long diagonal across the diagram. The dump does not read where the arrow points, so the
+  engine cannot keep the two together.
+- **The label band keeps the label's old height** after the structure grew wider. LabVIEW's
+  behaviour for that height on a widened structure is not measured.
+
+### 6c. Backward wires, measured, 2026-10-18
+
+`scripts/lvbd_backward_wires.py` reads every saved wire through pylabview, with no LabVIEW. It
+decodes the `compressedWireTable` (two-ended and fan-out formats, FINDINGS section 4) and counts
+each horizontal segment that runs west for 8 px or more. **Wires inside an XNode are left out.**
+Its generated diagram is never shown, and the Error Ring of every DQMH `--error.vi` carried two
+backward wires nobody can see. The first count included them: 57 instead of 42.
+
+Over `C:\Temp\ATM_DQMH_Cold`, all 76 VIs re-laid out with the rules above:
+
+| | backward wires | of wires |
+|---|---|---|
+| after the first project layout | 42 | 2177 |
+| after this section's fixes | 42 | 2177 |
+
+The total did not move, but the distribution did:
+
+- `Find Account.vi`'s backward wires came from the composer's collapsed Index Array, now 0.
+- 31 of the 42 are in the generated Caraya test VIs. In `Test Find Account.vi` all twelve are one
+  pattern: an Assert's `error out` going 25 px WEST into the Merge Errors tree behind the bands.
+- 7 are in Delacor's Main.vi and 4 in its `Obtain ... Events.vi`.
+
+So LabVIEW's router is not what produces most of them: the Merge Errors tree is placed so that
+each Assert's error wire has to come back to reach it. That is a placement rule to fix next. A
+router of our own would go through `Connect Wire` with Wiring Specs (`Joints[]` is read-only) and
+is not needed for that pattern.
+
+### 6d. The Merge Errors tree, labelled primitives and Find Account, 2026-10-18
+
+The user's review of the re-laid-out project named three more faults.
+
+**The Merge Errors tree behind a Caraya test sat at the bottom.** Its first-level merges were
+stacked from the rail up, so in `Test Find Account.vi` they sat at y 618-828 under asserts spread
+from y 52 to 809. That test lays out in COLUMNS, not bands (no crossing to save), so the band-only
+`CollectAfterBands` never touched it. `TreeRows` now runs in both variants. It moves a column only
+when everything above its rail is a pure error collector (two inputs or more, all error wires),
+centres each such node on its inputs, and keeps the rail's node in place. The merges now form a
+tree beside their asserts (`LayoutDqmhFrameworkTests.A_merge_errors_tree_sits_beside_what_it_collects`).
+
+**Backward wires did not fall with it.** `scripts/lvbd_backward_wires.py`, over all 76 VIs:
+
+| | backward wires |
+|---|---|
+| before this section | 42 |
+| after | 46 |
+
+`Test Find Account.vi` still has 12, one per assert. The pattern is now the fan-out from
+`Define Test` into each assert's `error in` (bottom left of the assert). That is the row where the
+assert's `Label` constant hangs, so LabVIEW's router comes in from above and turns 25 px back.
+This is a placement question about the constants, not about the merges. It is open.
+
+**A composed primitive showed its donor's label.** 12 of the harvested prim parts carry a VISIBLE
+label (objFlags `0x170142`, bit `0x8` clear). Find Account's "Fract/Exp String To Number" stood
+over its icon, 150 px wide. The composer now hides a primitive's own label (`|0x8`, as
+`_hide_label` already wrote for cluster fields), as LabVIEW places a primitive
+(`PylabviewPrimLabelTests`). Three composed VIs of the project had one and were patched.
+
+**A node was as wide as its label.** Bounds is icon and label together, and the parser widened the
+object to the label's end. For a node with terminals, the outline of its terminals is now the
+node; the rest is overhang (`DiagramModel.Parse`). A label above or below a node takes no column
+width in `MakeBlock`, but it stays an obstacle.
+
+**Find Account's Index Array wires left the node underneath.** The heap patch that gave its Index
+Arrays NI's geometry moved the terminals and not the saved wires. LabVIEW repaired the old wires
+on load, and `Clean Up Wire` did not straighten them. Re-patched with every wire touching an Index
+Array reset to the composer's neutral table for its end count (`parts/wiretables.json`). LabVIEW
+then laid them out afresh. A native NI Index Array of five indices
+(`General Least Squares Fitting.vi`) has exactly the composer's geometry, so the node itself was
+right.
+
+### 6e. Constants keep a node's wired inputs clear, 2026-10-18
+
+**Cause of the twelve.** An assert's `Expected` (row 0) and `Label` (8 px in, rows 0-16) constants
+were stacked one under the other and centred on their terminals. That put the `Label` constant
+directly left of the node on rows 6-21, over the row of `Actual` (8-16, fed by the subVI under
+test) and 3 px above `error in` (24-32). The error fan-out from `Define Test` found no way in
+from the left, came down from above and turned 25 px back into every assert.
+
+**Rule.** A stack of constants hanging left of a node keeps the rows of the node's OTHER inputs,
+the ones a wire feeds, clear by `WireClear` (6 px). When it cannot, it is lifted above them.
+Structures are exempt: their left border is ports, placed by `Ports`. Without that exemption the
+ATM command loop's shift-register constants were lifted over the loop and two wires turned back
+in the main VI and its four copies.
+
+**Measured** with `scripts/lvbd_backward_wires.py` over all 76 VIs of ATM_DQMH_Cold:
+
+| | backward wires |
+|---|---|
+| before | 46 |
+| after | **13** |
+
+Every Caraya test VI is free of them; `Test Find Account.vi` went from 12 to 0. 11 of the 13 left
+are in Delacor's own VIs (Main.vi 7, the two `Obtain ... Events.vi` 2 each), and one each in
+`Apply ATM UI State.vi` and `Find Account.vi`. All 76 VIs stayed executable.
+
+**The cost is height.** A test VI's band is about 25 px taller per assert, because Expected and
+Label now stand above the assert: `Test Find Account.vi` 839 -> 1136 px. Left of the assert the
+only free row is 8 px high (`Register with caller test`), too low for a constant.
+
+Two wire tables are not decoded yet (`Get Sync Refnums.vi`, `Apply ATM UI State.vi`). The script
+counts them as `undecoded` instead of guessing.
+
+Test: `LayoutDqmhFrameworkTests.Constants_left_of_an_assert_keep_its_wired_inputs_clear`, which
+fails without the rule (a Label constant on an assert's `error in` row).
+
+### 6f. Index constants beside their indices, 2026-10-18
+
+The user's next review: Find Account's second Index Array still looked wrong. Its three column
+constants stood over the node and their wires knotted in the gap. Two rules had put them there.
+
+- **6e lifted the stack over every wired row.** The wired row here is the array input (0-18),
+  directly above the indices (18-42). Now the stack goes above OR below the wired rows, whichever
+  is the shorter way, and for an Index Array that is below the array input, beside its indices.
+- **The compaction's staircase lifted all three.** It lifts a node's constants so that the node
+  can move left, written for a chain of subVIs with ONE long constant each. Now it lifts only a
+  node holding exactly one constant.
+
+Planned: the constants at 82/105/128 against an array row that ends at 76, in index order
+(`LayoutDqmhFrameworkTests.Index_constants_go_under_the_wired_array_input`, which fails without the
+change). Live, the wires run straight into the indices, except that `column 2`'s crosses
+`column 3`'s. The constants are 23 px apart and the indices 8 px, so each wire needs a vertical
+of its own. LabVIEW's router lays each wire out alone and put `column 3`'s vertical left of
+`column 2`'s. A layout cannot force that order; only wire geometry of our own could.
+
+Over all 76 VIs: **11 backward wires** (13 before), every one in Delacor's VIs (Main.vi 7, the
+two `Obtain ... Events.vi` 2 each). All stayed executable. `Run Verify Account.vi` grew from 552 to
+700 px wide, where a stack of constants no longer rises.
+
+### 6g. Wire geometry of our own for a constant fan, measured, 2026-10-18
+
+**Not through `Connect Wire`.** Its `Wiring Specs` input is a two-dimensional STRING array, read off
+the composer's harvested part (`invoke__LV_Terminal__Connect Wire.xml`). The strings' format is
+documented nowhere, and none of the five cached exports that call `Connect Wire`, NI's scripting
+examples among them, wires it. Probing it would mean guessing at a VI Server input, which is how
+LabVIEW has been killed here before.
+
+**Through the heap, with the composer's encoders.** `scripts/lvbd_fan_route.py` reads a
+block-diagram heap through `wire_route.Geometry` and `Hotpoints` (the composer's terminal
+rectangles and calibrated hotpoints). It finds every node fed by two or more two-ended wires from
+constants and writes each wire's `compressedWireTable` as east, vertical, east, with the verticals
+staggered across the gap. Where the fan rises, the lower constant turns farther right; where it
+falls, the upper one does. The first vertical stands 6 px right of the constants' hotpoints.
+
+**Measured on a copy of Find Account** after the layout had saved it. One fan of three wires was
+rewritten (`040801000C0A`, `040801001219`, `040801001828`: 12, 18 and 24 px east, up 10, 25 and
+40 px). LabVIEW kept that geometry on load. The render shows three straight steps where
+`Clean Up Wire` had crossed `column 2` and `column 3`, and the VI stayed executable.
+
+**It runs after the layout's save, as step 4b of `lvai_layout_diagram`** (`routeFans`, default
+true, `DiagramCleanup.FanRouteAsync`). The layout's own `Clean Up Wire` would replace every table,
+so the step comes after the save and after any compiled-code strip, with the VI released from
+LabVIEW, and rebuilds only when a table changed. A VI that carries compiled code is skipped and
+says so (`fanRouting.skipped`), as every pylabview edit here leaves one alone. The answer reports
+`fanRouting.fans` and `wiresRewritten`. Tests: `FanRouteTests` (a composed fan of three
+constants gets staggered verticals in the non-crossing order; the summary is parsed).
+
+Applied to all 76 VIs of ATM_DQMH_Cold: 190 wires in 21 VIs rewritten, no step failed, every VI
+still executable, and 12 backward wires (11 in Delacor's VIs). Find Account's column constants
+and every assert's Expected and Label now run in straight steps.

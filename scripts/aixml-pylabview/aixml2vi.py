@@ -1184,6 +1184,14 @@ class Composer:
                 flags = int(label.findtext("objFlags"))
                 if flags & LABEL_FLAG_DONOR_ONLY:
                     label.find("objFlags").text = str(flags & ~LABEL_FLAG_DONOR_ONLY)
+        if key.startswith("prim/"):
+            # a primitive shows no label, as LabVIEW places one: 12 of the harvested prims carry
+            # their donor's VISIBLE label (objFlags 1507650, 0x8 clear) - Find Account's
+            # "Fract/Exp String To Number" stood over its icon, 150 px wide, and held the
+            # indicators 118 px right of it (ATM_DQMH_Cold, 2026-10-18). 0x8 hides it
+            own = heap.find("label")
+            if own is not None and own.findtext("objFlags"):
+                own.find("objFlags").text = str(int(own.findtext("objFlags")) | 0x8)
         if heap.get("_images"):
             # Images EMBEDDED in the donor (DSIM sections, positive ImageResIDs) come along under
             # numbers free in this VI: a waveform control without them was "Could not load the
@@ -3273,12 +3281,38 @@ class Composer:
         harvested part carries ONE row, and every further terminal was cloned onto it: a Build
         Array of four elements stayed 17 px high with its four inputs on one spot, and the wires
         into it ran past a box too small for them (LayoutCheck, 2026-10-16). Measured on NI's
-        converter: 32 px wide, height 8 n + 1 (17 at least), terminal k on row 8 k, 16 px wide on
-        its side; the other side's terminal spans the height. agg_box(h) gives that one."""
-        h = max(17, self.AGG_ROW * len(row_terms) + 1)
+        converter: 32 px wide, height 8 n + 1, terminal k on row 8 k, 16 px wide on its side; the
+        other side's terminal spans the height. agg_box(h) gives that one. ONE terminal is 9 px:
+        a floor of 17 drew a one-element Build Array twice its height with the input in its upper
+        half (IfaceUE_TDMS3's Write Sample.vi, 2026-10-18); NI's converter draws Build Array,
+        Bundle and Unbundle with one row all 9 px high, measured."""
+        h = max(9, self.AGG_ROW * len(row_terms) + 1)
         self._set_box(node, h)
         self._set_term(agg, agg_box(h))
         return h
+
+    def _index_array_geometry(self, node, tl, dims, groups):
+        """Index Array grows 8 px a dimension and group. The harvested part carries one index,
+        and every further index and output was cloned onto it: the three columns of the ATM's
+        Find Account read through one Index Array arrived on ONE pin, and LabVIEW routed their
+        wires round the node and back (the user's review of ATM_DQMH_Cold, 2026-10-18).
+        Measured on NI's converter, 1D with one and three indices, 2D with a disabled column and
+        2D with two groups: 32 px wide; the array input (0, 0, 18, 16); group g starts at
+        y = 18 + 8 dims g, its indices 8 px apart on the left; group 0's output spans
+        (0, 16, 18 + 8 dims + 1, 32), a later group's (y, 16, y + 8 dims, 32); the node is
+        18 + 8 dims groups + 1 high."""
+        terms = list(tl)
+        h = 18 + 8 * dims * groups + 1
+        self._set_box(node, h, 32)
+        self._set_term(terms[0], (0, 0, 18, 16))
+        k = 1
+        for g in range(groups):
+            y = 18 + 8 * dims * g
+            self._set_term(terms[k], (0, 16, 18 + 8 * dims + 1, 32) if g == 0 else (y, 16, y + 8 * dims, 32))
+            k += 1
+            for d in range(dims):
+                self._set_term(terms[k], (y + 8 * d, 0, y + 8 * d + 8, 16))
+                k += 1
 
     def _waveform_bundle_geometry(self, node, agg, field_terms, names):
         """Build Waveform: its fields start 12 px down, under the waveform input, 16 px a row; the
@@ -3492,6 +3526,7 @@ class Composer:
                     tl.append(t)
                     ET.SubElement(dl, "SL__arrayElement", {"uid": t.find("dco").get("uid")})
                     self.ends[(el.get("uid"), key)] = (t.get("uid"), diag)
+            self._index_array_geometry(node, tl, n, len(idx_ins) // n)
             if len(idx_ins) // n > 1:
                 f = node.find("objFlags")
                 if f is None:
