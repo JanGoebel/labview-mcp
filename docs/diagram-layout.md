@@ -76,17 +76,60 @@ before its own diagram is arranged.
 **The spacing.** The user's review of 2026-10-16 found the compacted layout good but squeezed:
 "in X and in Y a little more room". The values went up as follows:
 
-| constant | was | now |
-|---|---|---|
-| between columns (`ColumnGap`) | 28 px | 40 px |
-| between rows (`RowGap`) | 14 px | 24 px |
-| from a constant to its node (`ConstantGap`) | 12 px | 18 px |
-| between stacked constants and between ports (`StackGap`) | 2 px | 6 px |
+| constant | first | 2026-10-16 | now (2026-10-18) |
+|---|---|---|---|
+| between columns (`ColumnGap`) | 28 px | 40 px | 24 px |
+| between rows (`RowGap`) | 14 px | 24 px | 18 px |
+| from a constant to its node (`ConstantGap`) | 12 px | 18 px | 10 px |
+| between stacked constants and between ports (`StackGap`) | 2 px | 6 px | 6 px |
+| per wire crossing a gap beyond the second (`WireLane`) | 6 px | 6 px | 2 px |
+| beside a structure inside, at the border (`Lane`) | 14 px | 14 px | 8 px |
 
-Every structure's inset grew by 8 px, 6 px at the top. Constants and ports share `StackGap`, so a
-constant stays level with the port it feeds. Over the 45 ATM VIs, measured on the renders, the
-median width went from 0.93 to 1.00 of the original's and the height from 0.73 to 0.83, with none
-wider than 1920 px.
+On 2026-10-16 every structure's inset grew by 8 px, 6 px at the top. Constants and ports share
+`StackGap`, so a constant stays level with the port it feeds. Over the 45 ATM VIs, measured on the
+renders, the median width went from 0.93 to 1.00 of the original's and the height from 0.73 to 0.83,
+with none wider than 1920 px.
+
+**The user's two reviews of 2026-10-18 found the result too large**, the second naming a goal: about
+1600 x 950 px for DQMH's `Main.vi`. The spacing above is now the tightest the tests allow, and each
+structure's SIDE inset is 4 px tighter (top and bottom unchanged). Planned from the fixtures:
+
+| VI | original | 2026-10-16 values | now |
+|---|---|---|---|
+| DQMH `Main.vi` (`dqmh-bank-main-original.txt`) | 1331 x 801 | 2224 x 1176 | 1752 x 1044 |
+| DQMH `Main.vi` after NI's clean-up (`dqmh-main-ni-cleanup.txt`) | 3805 x 1692 | - | 1879 x 960 |
+| DQMH `Stop Module.vi` | 1600 x 528 | 2780 x 591 | 2192 x 516 |
+| ATM main | 1866 x 793 | 1837 x 537 | 1592 x 511 |
+| `Test Find Account.vi` | 1183 x 839 | 1224 x 1136 | 1044 x 1070 |
+
+Three things came out of getting there, each found by a test failing at a tighter value:
+
+- **A multi-line subdiagram label's band follows its wrapped text** (`DiagramLayout.LabelBand`).
+  The band above a structure's code was the label's OLD height, while LabVIEW re-wraps the label
+  to the structure's width (section 6b saw the empty field it left). Delacor's six-line note over
+  the Error frame's inner case took 103 px for what fits three lines there. This alone took
+  Main.vi from 1089 to 1029 px high, with every spacing unchanged.
+- **A node's label may reach into the gap beside it, never past it.** A label above or below a
+  node takes no column width (section 6d), and at `ColumnGap` 28 or less "Fract/Exp String To
+  Number" reached over the gap onto Find Account's indicator. The width box now takes the part of
+  the label beyond `ColumnGap - LabelGap`.
+- **`RowGap` below 18 is refused by two tests**: at 16 the Samples constant of LayoutCheck's Main
+  sat in the run of the TDMS File Path wire, and a frame note was no longer at its frame's top.
+  At 14 px it bought 14 px of Main.vi's height, so it stays at 18.
+
+**Not taken: the top and bottom insets 3-4 px tighter.** That planned Main.vi 1752 x 1003, but in the
+NI-cleanup fixture a refnum wire then left the case at the height of its top, the #DQMH_HowTo block
+found every spot beside the case crossed by it and went ABOVE the case: 1879 x 1070 against 960.
+`A_top_level_note_goes_beside_the_structure_it_belongs_to` refuses it. The wire test uses a
+wire's bounding box, which over-states an L-shaped wire; settling that is open.
+
+**The goal is not reached, and spacing is not what is left.** With every gap at its minimum (10, 6,
+6, no lanes) Main.vi still plans 1530 x 1026: the height is the event loop over the message loop,
+each sized to its tallest frame, and the width the data-flow columns where Delacor packs a chain
+in two dimensions (section 6b). The remaining 150 x 95 px need that packing.
+
+Applied live to `C:\Temp\CleanupDemo`'s `Main.vi`, restored to Delacor's original first: see
+section 6h.
 
 - **Columns follow data flow.** The column is the longest path from a source, the old Sugiyama
   layering.
@@ -100,7 +143,7 @@ wider than 1920 px.
   came three columns after its producer, behind the panel set-up only it waits for, and the two
   loops ran next to each other across 2295 px. The user's review of 2026-10-16: the original,
   stacked layout was better than ours.
-- **A gap is as wide as the wires crossing it.** `ColumnGap` plus 6 px (`WireLane`) per
+- **A gap is as wide as the wires crossing it.** `ColumnGap` plus 2 px (`WireLane`, 6 until 2026-10-18) per
   wire beyond the second, counting wires from node to node and, in a frame, wires from the left
   border and to the right border. The frame's insets grow the same way. At a plain 28 px, five
   wires from the ATM consumer loop's shift registers crossed the gaps around its three subVIs, and
@@ -780,3 +823,141 @@ constants gets staggered verticals in the non-crossing order; the summary is par
 Applied to all 76 VIs of ATM_DQMH_Cold: 190 wires in 21 VIs rewritten, no step failed, every VI
 still executable, and 12 backward wires (11 in Delacor's VIs). Find Account's column constants
 and every assert's Expected and Label now run in straight steps.
+
+### 6h. Applied live to CleanupDemo's Main.vi, 2026-10-18
+
+`C:\Temp\CleanupDemo` is a fresh Singleton DQMH module. Its `Main.vi` was restored to Delacor's
+original before each run, then laid out by a server built from the changed tree, over raw stdio:
+
+| engine | planned and landed | objects where planned | executable |
+|---|---|---|---|
+| 2026-10-16 spacing | 2224 x 1176 | 140 of 140 | yes |
+| first review (gaps half way back) | 1990 x 1089 | 140 of 140 | yes |
+| second review (section 3, "The spacing") | 1752 x 1044 | 140 of 140 | yes |
+
+The render of the last one: the error rail straight along the bottom, both loops stacked, nothing
+overlapping. One cosmetic point: the `External Launch?` label of the right-hand case sits on that
+case's top border. The goal of about 1600 x 950 px is not reached; section 3 says what is left.
+
+
+**The whole of `C:\Temp\ATM_DQMH_Cold`, the same day** (already laid out once by the earlier
+engine): 76 of 76 VIs laid out, every object where planned, no helper error, all 76 executable
+afterwards. 40 of Delacor's Bank VIs carry compiled code before and after alike; the layout leaves
+a VI that already had it as it was. Sizes now against the previous layout: Bank `Main.vi`
+2224 x 1095 -> 1815 x 958, `Stop Module.vi` 2744 -> 2164 px wide, the four request API VIs
+(`Verify Account.vi`, `Withdraw.vi`, `Get Balance.vi`, `Deposit.vi`) about 2700 -> 2320 px - still
+over 1920, one long Delacor chain each - and `Test Find Account.vi` 1183 -> 1003 px wide. In the
+message loop's short frames the code still sits low under an empty field: all frames share the
+tallest frame's size and one error rail.
+
+### 6i. The user's third review, and where the time goes, 2026-10-18
+
+The user pointed at Bank `Main.vi`'s Error frame: less "exactly one behind the other", the
+`error out` local higher, comments placed so the code has room, and speed.
+
+**Time per step, measured.** `lvai_layout_diagram` answers `timingsMs` per step now (hold, dump,
+plan, apply, verify, stripCompiled, fanRouting, render). Over ATM_DQMH_Cold's 76 VIs through ONE
+server process, as an agent calls it: hold 29.6 s (loading each VI, a Caraya test 1.6-2.5 s), dump
+11.1 s, plan 0.2 s, apply 15.2 s, **verify 36.8 s**, fan routing 9.0 s - 102 s in all. The verify
+dump ran after the fan routing, which releases the VI for its pylabview edit, so it loaded every VI
+cold a second time. Fan routing and compiled-code stripping change wire geometry and compiled code,
+never where an object is, so the verify now runs while the VI is still held: verify 10.9 s, the run
+81.7 s on a fresh copy of the same state (-20 %). A process per VI instead of one cost only about
+4 % - the time is LabVIEW's, not the server's start. Fan routing on a VI with no fan cost 1.0 s over
+15 VIs, so it keeps its extract.
+
+**An error branch sink leaves the rail** (`IsErrorBranchSink`). A node that reads the error and
+passes nothing on, while its source carries the error on to another node or out by the right
+border, goes above the rail. The error edge is told by the SOURCE's terminal too - a local
+variable's own terminal is named after the local, so the edge into DQMH's `error out` local was not
+an error edge by its sink. Test `An_error_local_the_chain_only_branches_into_sits_above_the_rail`.
+
+**Comments.** A node comment that reaches past the code costs its growth in `PlaceComment` (width
+3x, height 2x per px). A frame note goes beside the code only where widening costs less than HALF
+the area of growing - width counts double, since a diagram runs out of width first. With area
+counted alike, the Error frame's notes went beside the code once another frame came out lower and
+the message loop grew 340 px wider for 137 px less height.
+
+**Tried and taken out: balancing the columns.** Longest path puts every node with nothing before it
+into the first column, and the tallest column of a frame was given nodes to later columns, each
+kept before what it feeds and no wider than its new column. The Initialize frame of
+`dqmh-main-original.txt` went from 568 x 279 to 539 x 216 - but the frames of one case share one
+rail and one size, and the whole case did not come down: Bank Main 1044 -> 1014 px high, while
+`dqmh-main-original.txt` grew 32 px wider at the same height and the NI-cleanup fixture 9 px
+higher, and a frame note lost its place at the frame's top. A frame's height is the maximum over
+its case's frames of code above the shared rail plus code below it; lowering one frame pays only
+when it is that maximum.
+
+**Also tried and not shipped: putting a frame's notes side by side**, re-wrapped narrower. The
+apply helper can be taught to write a comment's `Bounds:Area Width` and `Area Height` (whether
+LabVIEW accepts the write is NOT measured), and LabVIEW's free labels wrap at about their width
+minus 20 px (fixtures, `Bold` underestimated). It was dropped because the Error frame, whose two
+`#CodeRecommended` notes it would put side by side, is not the frame that sets the message loop's
+height.
+
+**Result on ATM_DQMH_Cold**: 76 of 76 laid out, every object where planned, 76 of 76 executable;
+Bank `Main.vi` 1815 x 958 -> 1815 x 943, the `error out` local above the rail in the Error frame.
+
+### 6j. Parallel layout in one process: `lvai_layout_diagrams`, 2026-10-18
+
+**Two server processes sharing one set of helper VIs read each other's answers.** Both ran
+`lvbd_layout_dump.vi` and `lvbd_layout_apply.vi` - one VI each in LabVIEW's memory - and wrote and
+read their controls at the same time: 49 of 76 VIs came back `dumpFailed` or with `landedExactly: 0`
+(the verify dump had read another VI). With helper VIs named per process the same two processes
+laid out 76 of 76 where planned, and four processes took 46 s against 73 s for one.
+
+**In ONE process every ActiveX operation was serialised** by `LabViewCom`'s gate, added 2026-10-14
+after two operations on the same VI raced (`Error 1026`). So the gate has LANES now: an operation in
+a lane runs beside the other lanes and never beside a default one; everything that is not a worker
+of `lvai_layout_diagrams` is in the default lane and runs alone exactly as before. Each worker gets
+`lane<N>` and `ComposedHelpers` names its helper VIs after it (`lvbd_layout_dump lane0.vi`); a
+worker never shares a VI with another.
+
+**Measured over ATM_DQMH_Cold's 76 VIs, one call, one process, fresh copies of the same state:**
+
+| workers | wall | result |
+|---|---|---|
+| 1 | 78.2 s (117.5 s on a first run) | 76 of 76 where planned |
+| 2 | 46.2 s | 76 of 76 |
+| 4 | 35.1 s (35.2 s twice) | 76 of 76, all 76 executable afterwards |
+| 8 | 31.8 s | 76 of 76 |
+
+The first call with a new number of workers composes that many helper sets (63 s for four instead
+of 35). Four is the default. On grpc the tool runs one VI after the other: NI's service running two
+helper VIs at once is not measured.
+
+### 6k. Layout at compose time on pylabview: measured, not built, 2026-10-19
+
+**The question** (the user's): a VI we generate is AIXML first, so why load it into LabVIEW and
+read it back for the layout? AIXML carries no coordinate, no size and no terminal position, so the
+engine cannot plan from it. What could plan from it is our COMPOSER, which knows node sizes from its
+parts, terminal hotpoints and wire geometry when it writes the heap - so the layout could be
+written at compose time and the `cleanUpDiagram` step skipped.
+
+**What that step costs on a freshly composed VI**, measured through `lvai_layout_diagrams`
+(`parallel: 1`, `verify: false`, as the step runs it) on four VIs composed from
+`accumulate-across-a-loop.xml`, `user-event-two-loops.xml`, `lvbd_coercion_dots.xml` and
+`lvai_exec_state.xml`:
+
+| VI | hold | dump | plan | apply | fan routing | total |
+|---|---|---|---|---|---|---|
+| accumulate-across-a-loop | 86 | 257 | 68 | 387 | 386 | 1189 ms |
+| coercion | 92 | 194 | 14 | 337 | 99 | 739 ms |
+| exec state | 67 | 112 | 4 | 216 | 59 | 461 ms |
+| user-event-two-loops | 60 | 252 | 18 | 348 | 77 | 758 ms |
+
+Composing the same VIs took 0.5-1.9 s each. A layout written at compose time would save the hold,
+the dump and the apply - **0.4 to 0.7 s per new VI**. An agent build of thirteen VIs would gain about
+7 s, about one model turn (`docs/workflow-economics.md`: 7.1 s median per turn).
+
+**What it would cost**: a model of the diagram built from the composer's guesses rather than from
+LabVIEW, where LabVIEW decides several sizes itself on load - constants sized to their text, a
+structure's Frame Size, tunnel positions, subdiagram labels re-wrapped - and the apply's
+`CleanUpWire` over every wire, which the composer's own wire geometry does not reproduce. A layout
+planned on geometry that LabVIEW then changes lands off, and only a render shows it.
+
+**Decision: no-go**, on these numbers. The time in a layout run goes to LabVIEW loading VIs that are
+NOT new - an existing project's test hierarchies took 14.8 s for one VI (section 6j) - and to model
+turns, not to the 0.4-0.7 s a new VI's layout costs inside the same tool call. Revisit if a build
+generates hundreds of VIs in one call, or if the composer's geometry is ever measured to match
+LabVIEW's dump object for object.

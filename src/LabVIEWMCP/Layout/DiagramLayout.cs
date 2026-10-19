@@ -53,10 +53,14 @@ internal sealed class LayoutPlan
 internal static class DiagramLayout
 {
     // the user's review of 2026-10-16: "in X and in Y a little more room - it looks very squeezed".
-    // Before it: 28, 14, 12 and 2 px, and every structure's inset 8 px tighter (6 at the top)
-    public const int ColumnGap = 40;
-    public const int RowGap = 24;
-    public const int ConstantGap = 18;
+    // Before it: 28, 14, 12 and 2 px, and every structure's inset 8 px tighter (6 at the top).
+    // Then 40, 24, 18, WireLane 6; the user's two reviews of 2026-10-18 found that too large (the
+    // goal named: about 1600 x 950 for DQMH's Main.vi). Now the tightest the tests allow - RowGap
+    // below 18 put constants into wire runs - with each structure's side inset 4 px tighter: Main.vi
+    // planned 2224 x 1176 then and 1752 x 1044 now (docs/diagram-layout.md, "The spacing")
+    public const int ColumnGap = 24;
+    public const int RowGap = 18;
+    public const int ConstantGap = 10;
     /// <summary>Between constants stacked on one node, and between ports on one border: the same
     /// gap, so a constant stays level with the port it feeds.</summary>
     public const int StackGap = 6;
@@ -80,11 +84,11 @@ internal static class DiagramLayout
     public const int SubdiagramLabelMax = 600;
     /// <summary>Extra inset where a structure inside sits against the border: room for a wire
     /// between its ports and ours to run up or down.</summary>
-    public const int Lane = 14;
+    public const int Lane = 8;
     /// <summary>How far a constant hanging left of a node stays off the row of an input a wire feeds.</summary>
     public const int WireClear = 6;
     /// <summary>Extra width a gap between columns gets per wire crossing it beyond the second.</summary>
-    public const int WireLane = 6;
+    public const int WireLane = 2;
     /// <summary>How far a constant may rise above its terminal to let its node move left. With no
     /// limit, an ATM test's expected value rose 150 px and wired down past four assertions; over
     /// the 45 VIs of that project 120 px cost 3 % of the mean width.</summary>
@@ -99,11 +103,11 @@ internal static class DiagramLayout
     /// left, top, right, bottom. A loop's bottom keeps room for i and the stop terminal.</summary>
     private static (int L, int T, int R, int B) Insets(string cls) => cls switch
     {
-        "WhileLoop" => (26, 20, 26, 38),
-        "ForLoop" => (32, 28, 26, 38),
-        "CaseStructure" or "DisableStructure" => (24, 28, 24, 20),
-        "EventStructure" => (24, 32, 24, 20),
-        _ => (24, 26, 24, 24),
+        "WhileLoop" => (18, 17, 18, 36),
+        "ForLoop" => (24, 25, 18, 36),
+        "CaseStructure" or "DisableStructure" => (16, 25, 16, 16),
+        "EventStructure" => (16, 29, 16, 16),
+        _ => (16, 23, 16, 20),
     };
 
     private sealed class Arrangement
@@ -313,7 +317,7 @@ internal static class DiagramLayout
         // ---- the rail
         var railOf = new Dictionary<DObject, int>();
         foreach (var n in layoutNodes.Where(mainChain.Contains))
-            if (RailOffset(ctx, n, graph) is { } r) railOf[n] = r;
+            if (!IsErrorBranchSink(graph, n) && RailOffset(ctx, n, graph) is { } r) railOf[n] = r;
 
         // per column: one node on the rail, the rest stacked above it in their current order
         var colPlans = new List<(List<DObject> Above, DObject? OnRail)>();
@@ -741,10 +745,17 @@ internal static class DiagramLayout
             }
         var best = start;
         var bestCost = long.MaxValue;
+        // a comment that reaches past the code makes the diagram bigger by that much, wider most of
+        // all: DQMH's "If the module is running standalone ..." kept its place right of its subVI and
+        // made the Error frame's inner case 260 px wider, with room for it above the code (the
+        // user's review, 2026-10-18)
+        var code = objects.Count == 0 ? (Box?)null : Box.Union(objects);
+        int Growth(Box c) => code is not { } k ? 0
+            : 3 * (Math.Max(0, c.R - k.R) + Math.Max(0, k.L - c.L)) + 2 * (Math.Max(0, k.T - c.T) + Math.Max(0, c.B - k.B));
         foreach (var c in candidates)
         {
             if (objects.Any(o => o.Overlaps(c, 4))) continue;
-            var cost = wires.Count(b => b.Overlaps(c, 1)) * 10_000L + Math.Abs(c.L - start.L) + Math.Abs(c.T - start.T);
+            var cost = wires.Count(b => b.Overlaps(c, 1)) * 10_000L + Math.Abs(c.L - start.L) + Math.Abs(c.T - start.T) + Growth(c);
             if (cost < bestCost) { bestCost = cost; best = c; }
         }
         return best;
@@ -833,7 +844,6 @@ internal static class DiagramLayout
         }
         ctx.Plan.StructuresArranged++;
         var (il, it, ir, ib) = Insets(s.Class);
-        var labelH = s.Frames.Select(f => SubdiagramLabels(f, s).Select(t => t.Box.H + 4).DefaultIfEmpty(0).Max()).DefaultIfEmpty(0).Max();
         var arrangements = s.Frames.ToDictionary(f => f, f => Arrange(ctx, f, isTop: false));
         var rail = arrangements.Values.Where(a => a.Rail is not null).Select(a => a.Rail!.Value).DefaultIfEmpty(-1).Max();
         var contentH = 0;
@@ -869,8 +879,6 @@ internal static class DiagramLayout
             var right = a.Pos.Select(kv => Extent(ctx, kv.Key, kv.Value.X, kv.Value.Y).R).DefaultIfEmpty(0).Max();
             used = Math.Max(used, dataNode[f] + right);
         }
-        shape.Top = it + labelH;
-        shape.PortTop = shape.Top;
         var labels = s.Frames.SelectMany(f => SubdiagramLabels(f, s)).ToList();
         var labelW = labels.Select(t => t.Box.W).DefaultIfEmpty(0).Max();
         shape.W = Math.Max(Math.Max(used + ir, 60), Math.Min(labelW, SubdiagramLabelKeep) + (s.Box.W - labelW > 0 && s.Box.W - labelW < 40 ? s.Box.W - labelW : 12));
@@ -884,6 +892,14 @@ internal static class DiagramLayout
         // height left above the code made Stop Module 3081 px wide against 1600 (2026-10-18)
         var textW = labels.Where(t => t.Text is not null).Select(LabelWidth).DefaultIfEmpty(0).Max();
         shape.W = Math.Max(shape.W, Math.Min(textW, SubdiagramLabelMax));
+        // the band a subdiagram label takes above the code: LabVIEW re-wraps a multi-line label to
+        // the structure's width, so it needs the lines its text wraps to THERE, not its old height.
+        // Kept at the old height, Delacor's six-line note over the Error frame's inner case made a
+        // band of 103 px for three lines of text, and DQMH's Main.vi 1089 px high (2026-10-18)
+        var labelH = s.Frames.Select(f => SubdiagramLabels(f, s).Select(t => LabelBand(t, shape.W) + 4)
+            .DefaultIfEmpty(0).Max()).DefaultIfEmpty(0).Max();
+        shape.Top = it + labelH;
+        shape.PortTop = shape.Top;
         shape.H = Math.Max(shape.Top + contentH + ib, 50);
         shape.Rail = rail >= 0 ? shape.Top + rail : null;
         if (shape.Rail is null && s.Terms.Any(t => IsError(t.Name)))
@@ -902,6 +918,17 @@ internal static class DiagramLayout
         }
         Ports(ctx, s, shape, ib);
         return shape;
+    }
+
+    /// <summary>The height a subdiagram label takes on a structure <paramref name="structureW"/>
+    /// wide: its own box for a one-line label or one whose text the dump did not read, else the
+    /// lines its text wraps to at that width, never more than its box held.</summary>
+    internal static int LabelBand(DObject t, int structureW)
+    {
+        var capacity = t.Box.H / TextMetrics.LineHeight;
+        if (t.Text is null || capacity <= 1) return t.Box.H;
+        var lines = Math.Min(capacity, TextMetrics.WrappedLines(t.Text, Math.Max(1, structureW - LabelTextPad)));
+        return t.Box.H - (capacity - lines) * TextMetrics.LineHeight;
     }
 
     /// <summary>The width a subdiagram label needs to show its text in the lines its box holds:
@@ -948,7 +975,11 @@ internal static class DiagramLayout
                 if (wide is not null)
                 {
                     var extraW = Math.Max(0, wide.Values.Max(b => b.R) - contentW);
-                    if ((long)extraW * contentH < (long)Math.Max(0, stackH - codeTop0) * contentW)
+                    // width counts double: a diagram runs out of width first (a 1920 px screen,
+                    // and the user's goal of about 1600 x 950 for DQMH's Main). Counted alike, the
+                    // Error frame's notes went beside its code once the Initialize frame was
+                    // balanced lower, and the message loop grew 340 px wider for 137 px less height
+                    if (2L * extraW * contentH < (long)Math.Max(0, stackH - codeTop0) * contentW)
                     {
                         spots = wide;
                         contentW += extraW;
@@ -1340,6 +1371,23 @@ internal static class DiagramLayout
     /// that indicator stayed where it was and a constant was laid over it (LayoutCheck,
     /// 2026-10-16).
     /// </summary>
+    /// <summary>
+    /// A node the error chain only BRANCHES into: it reads the error and passes nothing on - no wire
+    /// out, no border - while the node feeding it carries the error on elsewhere. DQMH's Error frame
+    /// writes its `error out` local that way; on the rail the local stood between Merge Errors and
+    /// the border, with the rail running through it (the user's review, 2026-10-18). It goes above.
+    /// </summary>
+    private static bool IsErrorBranchSink(Graph g, DObject n)
+    {
+        // by the SOURCE's terminal too: a local variable's own terminal carries no error name, so
+        // the edge into DQMH's `error out` local is not an error edge by its sink
+        static bool Err(Edge e) => e.Error || (e.FromTerm is { } t && IsError(t.Name));
+        return g.Out(n).Count == 0
+               && g.In(n).Where(e => e.From != n && Err(e)).ToList() is { Count: > 0 } ins
+               // carried on elsewhere: to another node, or out by the right border
+               && ins.All(e => g.FeedsRight.Contains(e.From) || g.Out(e.From).Any(o => Err(o) && o.To != n));
+    }
+
     internal static bool IsBorderNode(Diagram d, DObject o) =>
         d.Owner is { Class: "EventStructure" } && (IsEventDataNode(o) || IsFilterNode(o));
 
@@ -1389,7 +1437,11 @@ internal static class DiagramLayout
         // a label ABOVE or BELOW the node takes no column width: it stays an obstacle (Box) but
         // the next column may start beside it, where Find Account's indicators stood 118 px right
         // of "Fract/Exp String To Number" for nothing but its label
-        var widthParts = new List<Box> { oT > 0 || oB > 0 ? new Box(0, -oT, w, h + oT + oB) : parts[0] };
+        // It may reach into the gap beside the node, never past it: at a 28 px ColumnGap
+        // "Fract/Exp String To Number" reached over the gap onto the indicator beside it
+        var reachL = Math.Max(0, oL - ColumnGap + LabelGap);
+        var reachR = Math.Max(0, oR - ColumnGap + LabelGap);
+        var widthParts = new List<Box> { oT > 0 || oB > 0 ? new Box(-reachL, -oT, w + reachL + reachR, h + oT + oB) : parts[0] };
         var wanted = new List<(DObject C, Box B, int L, int T)>();
         foreach (var (c, to) in constants ?? new List<(DObject C, Term? To)>())
         {
