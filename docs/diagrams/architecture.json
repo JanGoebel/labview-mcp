@@ -3,7 +3,7 @@
   "diagram_type": "architecture",
   "meta": {
     "title": "LabVIEW MCP Server Architecture",
-    "output": ".docs/diagrams/architecture.html",
+    "output": "docs/diagrams/architecture.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/Zuehlke/labview-mcp.git",

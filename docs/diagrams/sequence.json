@@ -3,7 +3,7 @@
   "diagram_type": "sequence",
   "meta": {
     "title": "lvai_generate_vi Runtime Sequence (grpc backend)",
-    "output": ".docs/diagrams/sequence.html",
+    "output": "docs/diagrams/sequence.html",
     "quality_profile": "showcase",
     "repository": {
       "url": "https://github.com/Zuehlke/labview-mcp.git",

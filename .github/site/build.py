@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+ITEMS_MARKER = "<!-- ITEMS -->"
 
 
 def title_of(page: Path) -> str:
@@ -32,8 +33,12 @@ def main(data_dir: str, out_dir: str) -> None:
     stats = out / "stats"
     stats.mkdir(parents=True)
     shutil.copy(REPO / ".github/stats/site/index.html", stats / "index.html")
+    (stats / "data").mkdir()
     if Path(data_dir).is_dir():
-        shutil.copytree(data_dir, stats / "data")
+        # Regular files only: a symlink committed to the stats branch must not publish what it points at.
+        for f in Path(data_dir).iterdir():
+            if f.is_file() and not f.is_symlink():
+                shutil.copy(f, stats / "data" / f.name)
 
     diagrams = sorted((REPO / "docs/diagrams").glob("*.html"))
     (out / "diagrams").mkdir()
@@ -41,13 +46,15 @@ def main(data_dir: str, out_dir: str) -> None:
         shutil.copy(page, out / "diagrams" / page.name)
 
     items = [("stats/", "Download statistics", "Daily release-asset downloads and repository traffic")]
-    items += [(f"diagrams/{p.name}", title_of(p), "Diagram, generated from the source at a pinned commit")
+    items += [(f"diagrams/{p.name}", title_of(p), "Diagram")
               for p in diagrams]
     rows = "\n".join(
         f'    <li><a href="{html.escape(href)}">{html.escape(name)}</a><span>{html.escape(note)}</span></li>'
         for href, name, note in items)
     template = (REPO / ".github/site/index.html").read_text(encoding="utf-8")
-    (out / "index.html").write_text(template.replace("<!-- ITEMS -->", rows), encoding="utf-8")
+    if ITEMS_MARKER not in template:
+        sys.exit(f"build.py: {ITEMS_MARKER} is missing from .github/site/index.html")
+    (out / "index.html").write_text(template.replace(ITEMS_MARKER, rows), encoding="utf-8")
     print(f"site: {len(items)} item(s) in {out}")
 
 

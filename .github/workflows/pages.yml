@@ -8,7 +8,9 @@ name: pages
 #   /diagrams/     every docs/diagrams/*.html (architecture and sequence diagrams)
 #
 # The daily cron and a manual run take a new stats snapshot; a push that changes a diagram or
-# the site only republishes, with the stats data the `stats` branch already holds.
+# the site only republishes, with the stats data the `stats` branch already holds. GitHub keeps
+# one PENDING run per concurrency group, so a push queued behind a waiting cron run replaces it
+# and that day gets no snapshot; counts are cumulative, so this coarsens the deltas, loses none.
 #
 # Why release assets and not only the traffic API: every plugin install or update fetches
 # /releases/latest/download/labview-mcp.zip (.claude-plugin/marketplace.json is an `archive`
@@ -39,21 +41,21 @@ on:
       - '.github/stats/site/**'
       - '.github/workflows/pages.yml'
 
-permissions:
-  contents: write     # push the snapshot to the stats branch
-  actions: read       # list release.yml / verify-release.yml runs
-  pages: write
-  id-token: write
+permissions: {}      # granted per job below
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
-  collect:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write     # push the snapshot to the stats branch
+      actions: read       # list release.yml / verify-release.yml runs
     steps:
-      - name: Checkout (collector and page)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Check out the stats branch, or start it
@@ -91,8 +93,12 @@ jobs:
           path: _site
 
   deploy:
-    needs: collect
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
