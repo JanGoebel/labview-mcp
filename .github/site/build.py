@@ -34,9 +34,13 @@ def main(data_dir: str, out_dir: str) -> None:
     stats.mkdir(parents=True)
     shutil.copy(REPO / ".github/stats/site/index.html", stats / "index.html")
     (stats / "data").mkdir()
-    if Path(data_dir).is_dir():
-        # Regular files only: a symlink committed to the stats branch must not publish what it points at.
-        for f in Path(data_dir).iterdir():
+    source = Path(data_dir)
+    # No symlinks, at either level: one committed to the stats branch must not publish what it
+    # points at - .git/config holds the checkout's token.
+    if source.is_symlink():
+        sys.exit(f"build.py: {data_dir} is a symlink; refusing to publish through it")
+    if source.is_dir():
+        for f in source.iterdir():
             if f.is_file() and not f.is_symlink():
                 shutil.copy(f, stats / "data" / f.name)
 

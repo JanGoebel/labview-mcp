@@ -10,7 +10,9 @@ name: pages
 # The daily cron and a manual run take a new stats snapshot; a push that changes a diagram or
 # the site only republishes, with the stats data the `stats` branch already holds. GitHub keeps
 # one PENDING run per concurrency group, so a push queued behind a waiting cron run replaces it
-# and that day gets no snapshot; counts are cumulative, so this coarsens the deltas, loses none.
+# and that day gets no snapshot. Download counts are cumulative and traffic is re-read for 14 days,
+# so this only coarsens the deltas - unless snapshots stop for more than 14 days.
+# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs
 #
 # Why release assets and not only the traffic API: every plugin install or update fetches
 # /releases/latest/download/labview-mcp.zip (.claude-plugin/marketplace.json is an `archive`
