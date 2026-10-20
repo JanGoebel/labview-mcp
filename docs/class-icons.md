@@ -160,7 +160,7 @@ editable text items. The next edit in LabVIEW's icon editor started from pixels.
 
 `lvai_set_vi_icon viPath=<vi> keepOwnLayer=true [ownerPath=<.lvclass|.lvlib>]` sets no pixels. It
 runs the member route of §3 for this one VI: open the owner, open the VI, `ApplyIconToVIs`, save the
-VI (and the owner, which the helper always saves). An image or `line1`..`line3` together with
+VI (and the owner, which the helper always saves). An image or `line1`..`line4` together with
 `keepOwnLayer` is refused (`conflictingArguments`), because they would flatten the layer it keeps.
 Without `ownerPath`, the owner is the one `.lvclass`/`.lvlib` in the VI's folder or up to three above
 that **lists** the VI. `noOwner` and `ownerAmbiguous` refuse rather than guess.

@@ -799,12 +799,13 @@ afterwards by a route that does not keep it.
 lvai_set_vi_icon  viPath=<abs>  line1="DAQ"  line2="3AI"  line3="TDMS"
 ```
 
-`line1` becomes a coloured banner across the top, `line2` and `line3` sit under it, and the tool
-renders the 32x32 PNG, applies it and reads it back. Optional `bannerColor`, `backgroundColor`,
-`borderColor` take `RRGGBB`; the banner defaults to NI blue and the text colour is chosen for
-contrast, so you cannot ask for an unreadable icon. **Five characters per line is the ceiling** —
-abbreviate rather than spill; over-long lines are cut and reported in `warnings`. Drawable:
-`A-Z 0-9 space - . / : + #`, lowercase is upper-cased.
+`line1` becomes a coloured banner across the top, `line2`, `line3` and `line4` sit under it, and the
+tool renders the 32x32 PNG in LabVIEW's icon-editor font and layout, applies it and reads it back.
+Optional `bannerColor`, `backgroundColor`, `borderColor` take `RRGGBB`; the banner defaults to NI
+blue and the text colour is chosen for contrast, so you cannot ask for an unreadable icon. **28 px of
+ink per line is the ceiling, about six capitals** — write the word when it fits, abbreviate only when
+it does not; wider lines are cut and reported in `warnings`. Drawable: printable ASCII, case as
+typed.
 
 This replaced a `PowerShell` + `System.Drawing` recipe that used to live here. Profiling one whole
 generation showed why: **12.5 s went on composing and running that call**, against 0 ms now, and it

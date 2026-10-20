@@ -670,10 +670,11 @@ If Phase 4 found no real icon, have the tool draw one instead — **one call, no
 lvai_set_vi_icon  viPath=<abs>  line1="FILE"  line2="SORT"
 ```
 
-`line1` becomes a coloured banner, `line2` and `line3` sit under it, and the tool renders the 32x32
-PNG itself. Optional `bannerColor`, `backgroundColor`, `borderColor` as `RRGGBB`; text colour is
-picked for contrast. **Five characters per line is the ceiling** — abbreviate rather than spill;
-longer lines are cut and reported in `warnings`. Drawable: `A-Z 0-9 space - . / : + #`.
+`line1` becomes a coloured banner, `line2`, `line3` and `line4` sit under it, and the tool renders
+the 32x32 PNG itself in LabVIEW's icon-editor font and layout. Optional `bannerColor`,
+`backgroundColor`, `borderColor` as `RRGGBB`; text colour is picked for contrast. **28 px of ink per
+line is the ceiling, about six capitals** — write the word when it fits, abbreviate only when it does
+not; wider lines are cut and reported in `warnings`. Drawable: printable ASCII, case as typed.
 
 A `PowerShell` + `System.Drawing` recipe used to stand here. It was measured at **12.5 s** of a
 generation session, plus a whole extra tool call, against 0 ms now. Reaching for `System.Drawing`

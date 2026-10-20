@@ -371,6 +371,8 @@ scripts/                        copied next to the exe at build time; path in lv
   generate_labview_doc.py       documentation JSON -> .docx + structure and UML diagrams
   lvdoc_print.xml               AIXML for the helper VI that exports icon + connector pane
   Export-VIDoc.ps1              same over ActiveX; fallback, does not work on every station
+  Export-IconFont.ps1           regenerates Infra\IconFont.cs, the icon text glyphs, from
+                                Windows' "Small Fonts" through GDI (-Check compares only)
 
 .claude/agents/                 the source; plugin\agents\ is GENERATED from it, see below
   labview-doc-generator.md      the documentation agent that drives the scripts above

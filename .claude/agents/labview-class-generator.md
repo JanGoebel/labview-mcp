@@ -650,8 +650,8 @@ PNG — never build one yourself:
 lvai_set_vi_icon  viPath=<abs>  line1="NETZ"  line2="WR"  line3="SETP"
 ```
 
-Use `line1` for the class (a short tag, ≤5 characters) and the lines under it for the method, so
-one glance identifies both. Cover **every method VI you generated**, accessors included.
+Use `line1` for the class (a short tag, at most 28 px - about six capitals) and the lines under it
+for the method, so one glance identifies both. Cover **every method VI you generated**, accessors included.
 
 Two things about the answer, both measured: `errorCode 91` with empty outputs is the normal
 read-back artefact and **does not** mean failure — judge by `verified`; and `lvai_set_vi_icon`
