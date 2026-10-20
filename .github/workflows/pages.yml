@@ -1,7 +1,14 @@
-name: download-stats
+name: pages
 
-# Daily snapshot of release-asset download counts (and, with a token, repository traffic) into
-# CSV files on the `stats` branch, published as a GitHub Pages dashboard.
+# The ONE workflow that deploys GitHub Pages - a Pages deployment replaces the whole site, so a
+# second deploying workflow would wipe this one's pages. .github/site/build.py assembles it:
+#   /              landing page listing everything below
+#   /stats/        daily snapshot of release-asset download counts (and, with a token,
+#                  repository traffic), kept as CSV files on the `stats` branch
+#   /diagrams/     every docs/diagrams/*.html (architecture and sequence diagrams)
+#
+# The daily cron and a manual run take a new stats snapshot; a push that changes a diagram or
+# the site only republishes, with the stats data the `stats` branch already holds.
 #
 # Why release assets and not only the traffic API: every plugin install or update fetches
 # /releases/latest/download/labview-mcp.zip (.claude-plugin/marketplace.json is an `archive`
@@ -24,6 +31,13 @@ on:
     # timestamp between snapshots, so a late cron on either side is harmless.
     - cron: '41 8 * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/diagrams/**'
+      - '.github/site/**'
+      - '.github/stats/site/**'
+      - '.github/workflows/pages.yml'
 
 permissions:
   contents: write     # push the snapshot to the stats branch
@@ -32,7 +46,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: download-stats
+  group: pages
   cancel-in-progress: false
 
 jobs:
@@ -52,12 +66,14 @@ jobs:
           fi
 
       - name: Snapshot
+        if: github.event_name != 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STATS_TRAFFIC_TOKEN: ${{ secrets.STATS_TRAFFIC_TOKEN }}
         run: python3 .github/stats/collect.py stats-data/data
 
       - name: Commit to the stats branch
+        if: github.event_name != 'push'
         working-directory: stats-data
         run: |
           git config user.name 'github-actions[bot]'
@@ -68,10 +84,7 @@ jobs:
           git push origin stats
 
       - name: Assemble the site
-        run: |
-          mkdir -p _site
-          cp .github/stats/site/index.html _site/
-          cp -r stats-data/data _site/data
+        run: python3 .github/site/build.py stats-data/data _site
 
       - uses: actions/upload-pages-artifact@v3
         with:
