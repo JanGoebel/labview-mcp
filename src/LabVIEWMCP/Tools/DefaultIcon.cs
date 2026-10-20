@@ -33,9 +33,10 @@ internal static class DefaultIcon
 {
     /// <summary>Parameter text shared by every tool that carries the step.</summary>
     internal const string ParameterDescription = """
-        The VI's ICON, drawn as the last step: "L1|L2|L3" - banner text and up to two lines, 5
-        characters each, drawable A-Z 0-9 space - . / : + #. Omit it to have one DERIVED from the
-        VI's name (and its class or the tested subject); pass "none" to leave LabVIEW's blank icon.
+        The VI's ICON, drawn as the last step: "L1|L2|L3" - banner text and up to two lines, each
+        up to 28 px of ink (about six capitals), printable ASCII, in LabVIEW's icon-editor font.
+        Omit it to have one DERIVED from the VI's name (and its class or the tested subject); pass
+        "none" to leave LabVIEW's blank icon.
         It FLATTENS any class template layer the VI had (reported as templateLayerReplaced); set a
         class icon afterwards with lvai_set_owner_icon applyToMembers.
         """;
@@ -177,14 +178,18 @@ internal static class DefaultIcon
                         .Where(w => w.Length > 0 && !StopWords.Contains(w))];
     }
 
-    /// <summary>Upper-case and at most 5 characters: vowels after the first letter go first.</summary>
+    /// <summary>
+    /// Upper-case, and narrowed only as far as the icon needs: the whole word when its ink fits
+    /// <see cref="IconImage.MaxLineWidth"/>, else without the vowels after the first letter, else
+    /// that cut to fit. The limit used to be five characters, which cut LOGGER to LGGR although
+    /// it is 27 px and fits.
+    /// </summary>
     internal static string Abbreviate(string word)
     {
         var w = word.ToUpperInvariant();
-        if (w.Length <= IconImage.MaxCharsPerLine) return w;
+        if (IconImage.Fits(w)) return w;
         var b = new StringBuilder().Append(w[0]);
         foreach (var c in w[1..]) if ("AEIOU".IndexOf(c) < 0) b.Append(c);
-        var s = b.ToString();
-        return s.Length <= IconImage.MaxCharsPerLine ? s : s[..IconImage.MaxCharsPerLine];
+        return IconImage.Fit(b.ToString());
     }
 }

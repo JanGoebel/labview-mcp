@@ -32,9 +32,14 @@ internal sealed class IconTools(LvaiConnection connection)
         scripts\lvdoc_set_icon.xml (once, then reused), run it, read the icon back out.
         Measured on LabVIEW 2026: a 32x32 PNG is applied as-is and the icon read back out of
         the VI is pixel-identical. Other formats and sizes are untested.
-        TWO WAYS TO SUPPLY THE IMAGE. Either pass line1/line2/line3 and let this DRAW the
-        32x32 icon for you - banner across the top plus up to two lines under it, 5 characters
-        per line, from a built-in bitmap font - or pass iconImagePath if you have your own art.
+        TWO WAYS TO SUPPLY THE IMAGE. Either pass line1..line4 and let this DRAW the 32x32 icon
+        for you in the layout and font of LabVIEW's own icon editor - line1 in a banner across
+        the top, up to three lines under it - or pass iconImagePath if you have your own art.
+        The text is "Small Fonts" 7 px, the font hand-made LabVIEW icons use, drawn as typed:
+        upper and lower case, digits, space and ASCII punctuation. Each line may be 28 px of ink
+        wide, about six capitals (I is 1 px, M and W are 5, plus 1 px between letters); wider is
+        cut and reported in warnings. Write words rather than abbreviations where they fit, and
+        prefer capitals: lowercase is drawn, but its x-height is 3 px.
         PREFER THE LINES: drawing the PNG yourself through PowerShell and System.Drawing was
         measured at 12.5 s of a generation session, against 0 ms here, and it costs an extra
         tool call worth about 11 s of wall clock on top.
@@ -58,7 +63,7 @@ internal sealed class IconTools(LvaiConnection connection)
         string viPath,
         [Description("""
             Absolute path to a ready-made icon image; a 32x32 PNG is what was measured. Leave
-            this out and pass line1/line2/line3 instead to have the icon drawn here. If both
+            this out and pass line1..line4 instead to have the icon drawn here. If both
             are given the file wins and the lines are reported as ignored.
             """)]
         string? iconImagePath = null,
@@ -82,15 +87,23 @@ internal sealed class IconTools(LvaiConnection connection)
         [Description("Regenerate the helper VI even when it already exists")]
         bool regenerateHelper = false,
         [Description("""
-            Text for the coloured banner across the top of a drawn icon, e.g. "DAQ". Up to 5
-            characters; A-Z, 0-9, space and - . / : + # are drawn, anything else is reported.
-            Lowercase is upper-cased - a 5x7 cell has no room for descenders.
+            Text for the coloured banner across the top of a drawn icon, e.g. "DAQ". Up to 28 px
+            of ink, about six capitals; printable ASCII is drawn as typed, anything else is
+            reported.
             """)]
         string? line1 = null,
-        [Description("Second line of a drawn icon, under the banner. Up to 5 characters")]
+        [Description("""
+            First body line of a drawn icon, under the banner. Up to 28 px, about six capitals.
+            The body lines are centred and spaced for how many are given: one sits mid-body, two
+            or three are spread over it
+            """)]
         string? line2 = null,
-        [Description("Third line of a drawn icon. Up to 5 characters")]
+        [Description("Second body line of a drawn icon. Up to 28 px")]
         string? line3 = null,
+        [Description("""
+            Third body line of a drawn icon - hand-made icons often have three. Up to 28 px
+            """)]
+        string? line4 = null,
         [Description("""
             Banner colour of a drawn icon as RRGGBB or #RRGGBB. Defaults to 006699, the web-safe
             neighbour of NI blue - LabVIEW quantises a stored icon to the web-safe cube, so a
@@ -134,10 +147,10 @@ internal sealed class IconTools(LvaiConnection connection)
             // than one half silently ignored.
             if (keepOwnLayer)
             {
-                if (iconImagePath is { Length: > 0 } || HasAnyLine(line1, line2, line3))
+                if (iconImagePath is { Length: > 0 } || HasAnyLine(line1, line2, line3, line4))
                     return Json.Error("conflictingArguments",
                         "keepOwnLayer re-applies only the class or library template and sets no pixels; " +
-                        "iconImagePath and line1/line2/line3 set the VI's pixels and flatten its layers. " +
+                        "iconImagePath and line1..line4 set the VI's pixels and flatten its layers. " +
                         "Pass one or the other.");
                 return await BackendRoute.WithBackendAsync(choice.Name, "lvai_set_vi_icon", () => new OwnerIconTools(connection).ReapplyTemplateAsync(
                     viPath, ownerPath, readBackPath,
@@ -159,32 +172,34 @@ internal sealed class IconTools(LvaiConnection connection)
             {
                 if (!File.Exists(iconImagePath))
                     throw new FileNotFoundException($"No icon image at '{iconImagePath}'.", iconImagePath);
-                if (HasAnyLine(line1, line2, line3))
-                    imageNotes.Add("Both iconImagePath and line1/line2/line3 were given. The file was " +
+                if (HasAnyLine(line1, line2, line3, line4))
+                    imageNotes.Add("Both iconImagePath and line1..line4 were given. The file was " +
                                    "used and the lines were ignored.");
             }
-            else if (HasAnyLine(line1, line2, line3))
+            else if (HasAnyLine(line1, line2, line3, line4))
             {
                 var banner = Colour(bannerColor, NiBlue, nameof(bannerColor), imageNotes);
                 var background = Colour(backgroundColor, White, nameof(backgroundColor), imageNotes);
                 var border = Colour(borderColor, Black, nameof(borderColor), imageNotes);
 
                 foreach (var (line, name) in new[]
-                         { (line1, nameof(line1)), (line2, nameof(line2)), (line3, nameof(line3)) })
+                         { (line1, nameof(line1)), (line2, nameof(line2)), (line3, nameof(line3)),
+                           (line4, nameof(line4)) })
                     NoteLineProblems(line, name, imageNotes);
 
                 iconImagePath = Path.GetFullPath(DefaultRenderedIconPath(viPath));
                 EnsureDirectoryOf(iconImagePath);
                 await File.WriteAllBytesAsync(iconImagePath,
                     IconImage.Render(line1, line2, line3, banner, background, border,
-                                     IconImage.ReadableOn(banner), IconImage.ReadableOn(background)),
+                                     IconImage.ReadableOn(banner), IconImage.ReadableOn(background),
+                                     line4),
                     ct);
                 iconRendered = true;
             }
             else
             {
                 throw new ArgumentException(
-                    "Nothing to apply: pass line1 (and optionally line2/line3) to have a 32x32 icon " +
+                    "Nothing to apply: pass line1 (and optionally line2..line4) to have a 32x32 icon " +
                     "drawn here, or iconImagePath to use your own image. Drawing is cheaper - " +
                     "producing the PNG yourself costs an extra tool call and about 12 s.",
                     nameof(line1));
@@ -466,14 +481,15 @@ internal sealed class IconTools(LvaiConnection connection)
         if (string.IsNullOrWhiteSpace(line)) return;
 
         var trimmed = line.Trim();
-        if (trimmed.Length > IconImage.MaxCharsPerLine)
-            notes.Add($"{parameter} is {trimmed.Length} characters. Only the first " +
-                      $"{IconImage.MaxCharsPerLine} fit across a 32x32 icon; the rest was cut, " +
-                      $"leaving '{trimmed[..IconImage.MaxCharsPerLine]}'.");
+        if (IconImage.InkWidth(trimmed) is var width && width > IconImage.MaxLineWidth)
+            notes.Add($"{parameter} is {width} px wide. {IconImage.MaxLineWidth} px fit across a " +
+                      $"32x32 icon with 1 px to the frame, about six capitals; the rest was cut, " +
+                      $"leaving '{IconImage.Fit(trimmed)}'.");
 
         if (IconImage.Unsupported(trimmed) is { Length: > 0 } missing)
-            notes.Add($"{parameter} contains characters the icon font cannot draw, left blank: " +
-                      $"'{missing}'. Drawable: A-Z, 0-9, space, - . / : + #");
+            notes.Add($"{parameter} contains characters the icon font cannot draw, left out: " +
+                      $"'{missing}'. Drawable: printable ASCII - letters of both cases, digits, " +
+                      $"space and punctuation");
     }
 
     private static void EnsureDirectoryOf(string filePath)

@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using LabVIEWMcp.Infra;
 using LabVIEWMcp.Lvai;
 using LabVIEWMcp.Tests.Fakes;
 using LabVIEWMcp.Tests.Support;
@@ -406,7 +407,28 @@ public sealed class IconToolsTests : IDisposable
         // the response - this is the one contract the fake can check.
         var request = server.Service.Last<RunVIAsTopLevelRequest>("RunVIAsTopLevel");
         Assert.Equal(drawn, request.Inputs["Icon File Path"]);
-        Assert.Equal("", Warnings(result));   // a plain 5-char, 3-line icon warrants no warning
+        Assert.Equal("", Warnings(result));   // a plain three-line icon warrants no warning
+    }
+
+    [Fact]
+    public async Task line4_draws_a_third_body_line_into_the_file_sent_to_labview()
+    {
+        await using var server = await LvaiTestServer.StartAsync();
+        server.Service.ViFileContent = "generated helper";
+
+        var result = await new IconTools(server.Connection).SetViIconAsync(
+            WriteVi(), iconImagePath: null, readBackPath: PlantReadBack(), helperViPath: At("helper.vi"),
+            helperAixmlPath: ShippedHelperAixml(), line1: "DAQ", line2: "Read", line3: "AI",
+            line4: "TDMS");
+
+        Assert.True(Res.Bool(result, "iconRendered"));
+        Assert.Equal("", Warnings(result));
+        // Three body lines, so the icon editor's three cap tops: rows 13, 19 and 25.
+        var drawn = PngPixels.Decode(Res.Str(result, "iconImagePath")!);
+        var black = new PngPixels.Rgba(0, 0, 0, 255);
+        bool Inked(int y) => Enumerable.Range(1, 30).Any(x => drawn.At(x, y) == black);
+        Assert.Equal([13, 19, 25],
+                     new[] { 12, 18, 24 }.Select(row => Enumerable.Range(row, 6).First(Inked)).ToList());
     }
 
     [Fact]
@@ -441,7 +463,7 @@ public sealed class IconToolsTests : IDisposable
     }
 
     [Fact]
-    public async Task Warns_about_a_line_too_long_to_fit_but_still_applies_the_icon()
+    public async Task Warns_about_a_line_too_wide_to_fit_but_still_applies_the_icon()
     {
         await using var server = await LvaiTestServer.StartAsync();
         server.Service.ViFileContent = "generated helper";
@@ -452,8 +474,9 @@ public sealed class IconToolsTests : IDisposable
             line1: "ACQUISITION");
 
         Assert.True(Res.Bool(result, "iconRendered"));
-        Assert.Contains("Only the first 5", Warnings(result));
-        Assert.Contains("'ACQUI'", Warnings(result));
+        Assert.Contains("line1 is 44 px wide", Warnings(result));     // pixels, not characters
+        Assert.Contains("28 px fit", Warnings(result));
+        Assert.Contains("'ACQUISI'", Warnings(result));               // what was drawn
         Assert.Equal(1, server.Service.CountOf("RunVIAsTopLevel"));
     }
 
@@ -466,11 +489,11 @@ public sealed class IconToolsTests : IDisposable
         var result = await new IconTools(server.Connection).SetViIconAsync(
             WriteVi(), iconImagePath: null, readBackPath: At("readback.png"),
             helperViPath: At("helper.vi"), helperAixmlPath: ShippedHelperAixml(),
-            line1: "A_B", bannerColor: "octarine");
+            line1: "A€B", bannerColor: "octarine");
 
         var warnings = Warnings(result);
         Assert.Contains("cannot draw", warnings);
-        Assert.Contains("'_'", warnings);
+        Assert.Contains("'€'", warnings);
         Assert.Contains("not RRGGBB", warnings);
         Assert.Contains("006699", warnings);          // names the fallback it actually used
         Assert.True(Res.Bool(result, "iconRendered"));

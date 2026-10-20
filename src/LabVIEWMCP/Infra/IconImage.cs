@@ -15,76 +15,100 @@ namespace LabVIEWMcp.Infra;
 ///
 /// Dependency-free is deliberate. System.Drawing.Common is Windows-only and a package; a PNG
 /// encoder for one fixed size is about eighty lines, and IconTools already reads PNG headers by
-/// hand for exactly the same reason. Text is drawn from an embedded 5x7 bitmap font rather than
-/// a system typeface: at 32 px an anti-aliased TrueType glyph turns to mush, and a bitmap font
-/// is what LabVIEW icons have always used.
+/// hand for exactly the same reason.
+///
+/// THE TEXT IS THE ICON EDITOR'S FONT. LabVIEW's icon editor writes icon text in the Windows
+/// raster font "Small Fonts" at 7 px, so that is what a hand-made icon looks like, and
+/// <see cref="IconFont"/> holds those glyphs, generated from the font by
+/// scripts\Export-IconFont.ps1. Until 2026-10-20 this class drew a 5x7 font of its own - capitals
+/// only, five per line, banner rows 1-9 - and in a real toolkit its icons stood out beside the
+/// hand-made ones: bigger letters, text touching the frame, five-letter abbreviations. The layout
+/// is the icon editor's too, measured 2026-10-20 on six hand-made icons of one LabVIEW toolkit (one
+/// of them is reproduced pixel for pixel by the golden test in IconImageTests): 1 px frame, banner
+/// rows 1-10, a frame-coloured separator at row 11, body rows 12-30; every line centred on its ink,
+/// x = floor((32 - inkWidth) / 2); cap tops at <see cref="BannerTop"/> for the banner and at
+/// <see cref="BodyTops"/> for one, two or three body lines; no line wider than
+/// <see cref="MaxLineWidth"/>. docs/vi-server-reference.md has the measurements.
 /// </summary>
 internal static class IconImage
 {
     internal const int Size = 32;
 
-    /// <summary>5 px glyph + 1 px gap inside a 30 px writable width: 6n-1 &lt;= 30.</summary>
-    internal const int MaxCharsPerLine = 5;
+    /// <summary>
+    /// The widest line, in pixels of ink. 28 leaves one pixel of air between the text and the
+    /// frame on both sides of the 30 px interior - what the hand-made icons keep. About six
+    /// capitals: the glyphs are variable width (I is 1 px of ink, M and W are 5) with 1 px spacing.
+    /// </summary>
+    internal const int MaxLineWidth = 28;
 
-    private const int GlyphWidth = 5;
-    private const int GlyphHeight = 7;
+    /// <summary>Last banner row; the separator line is the row under it.</summary>
+    private const int BannerBottom = 10;
+
+    /// <summary>Cap top of the banner text, so it covers rows 3..8: five of caps, one descender.</summary>
+    internal const int BannerTop = 3;
 
     /// <summary>
-    /// The character order of <see cref="GlyphRows"/>. Uppercase only - a 5x7 cell has no room
-    /// for descenders, so lowercase input is upper-cased rather than rendered badly.
+    /// Cap tops of the body lines, indexed by how many there are. Each line takes six rows (cap
+    /// height 5 plus the font's one descender row), so three lines 6 rows apart touch and never
+    /// overlap, and the third line's descender ends on row 30, inside the frame.
     /// </summary>
-    private const string Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -./:+#";
+    internal static readonly int[][] BodyTops = [[], [19], [15, 23], [13, 19, 25]];
+
+    /// <summary>Whether the font can draw this character. Case is drawn as given.</summary>
+    internal static bool Supports(char c) => IconFont.Glyphs.ContainsKey(c);
 
     /// <summary>
-    /// Seven rows per glyph, in <see cref="Alphabet"/> order. Bit 4 (0b10000) is the leftmost
-    /// pixel, so a row reads left to right as written.
+    /// Everything in <paramref name="text"/> the font cannot draw, de-duplicated, so the tool can
+    /// warn about it instead of quietly leaving gaps.
     /// </summary>
-    private static readonly byte[] GlyphRows =
-    [
-        0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11,   // A
-        0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E,   // B
-        0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E,   // C
-        0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E,   // D
-        0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F,   // E
-        0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10,   // F
-        0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E,   // G
-        0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11,   // H
-        0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F,   // I
-        0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C,   // J
-        0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11,   // K
-        0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F,   // L
-        0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11,   // M
-        0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11,   // N
-        0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E,   // O
-        0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10,   // P
-        0x0E, 0x11, 0x11, 0x11, 0x15, 0x13, 0x0D,   // Q
-        0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11,   // R
-        0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E,   // S
-        0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04,   // T
-        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E,   // U
-        0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04,   // V
-        0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11,   // W
-        0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11,   // X
-        0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04,   // Y
-        0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F,   // Z
-        0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E,   // 0
-        0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E,   // 1
-        0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F,   // 2
-        0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E,   // 3
-        0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02,   // 4
-        0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E,   // 5
-        0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E,   // 6
-        0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08,   // 7
-        0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E,   // 8
-        0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C,   // 9
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   // space
-        0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00,   // -
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06,   // .
-        0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10,   // /
-        0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00,   // :
-        0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00,   // +
-        0x0A, 0x1F, 0x0A, 0x0A, 0x0A, 0x1F, 0x0A,   // #
-    ];
+    internal static string Unsupported(string? text) =>
+        text is null ? "" : new string(text.Where(c => !Supports(c)).Distinct().ToArray());
+
+    /// <summary>
+    /// The width of <paramref name="text"/>'s ink in pixels, first inked column to last; 0 for
+    /// text with no ink. Undrawable characters are left out, as <see cref="Render"/> leaves them out.
+    /// </summary>
+    internal static int InkWidth(string? text) => Layout(text).Width;
+
+    /// <summary>Whether <paramref name="text"/> fits in <see cref="MaxLineWidth"/>.</summary>
+    internal static bool Fits(string? text) => InkWidth(text) <= MaxLineWidth;
+
+    /// <summary>
+    /// The longest start of <paramref name="text"/> (trimmed) whose ink fits in
+    /// <see cref="MaxLineWidth"/> - what <see cref="Render"/> draws of a line that is too wide.
+    /// </summary>
+    internal static string Fit(string? text)
+    {
+        var line = text?.Trim() ?? "";
+        while (line.Length > 0 && !Fits(line)) line = line[..^1].TrimEnd();
+        return line;
+    }
+
+    /// <summary>
+    /// A line laid out from x = 0: the glyph cells side by side, each advanced by its own width,
+    /// as GDI's TextOut places a raster font. Ink is the first and last inked column.
+    /// </summary>
+    private sealed record LineLayout(List<(int X, string[] Rows)> Cells, int InkLeft, int Width);
+
+    private static LineLayout Layout(string? text)
+    {
+        var cells = new List<(int X, string[] Rows)>();
+        int x = 0, left = int.MaxValue, right = int.MinValue;
+        foreach (var c in text?.Trim() ?? "")
+        {
+            if (!IconFont.Glyphs.TryGetValue(c, out var glyph)) continue;   // reported by Unsupported()
+            var rows = glyph.Split('|');
+            for (var col = 0; col < rows[0].Length; col++)
+                if (rows.Any(r => r[col] == '#'))
+                {
+                    left = Math.Min(left, x + col);
+                    right = Math.Max(right, x + col);
+                }
+            cells.Add((x, rows));
+            x += rows[0].Length;
+        }
+        return right < left ? new LineLayout(cells, 0, 0) : new LineLayout(cells, left, right - left + 1);
+    }
 
     /// <summary>An 8-bit-per-channel colour. No alpha: LabVIEW icons are opaque.</summary>
     internal readonly record struct Rgb(byte R, byte G, byte B);
@@ -137,80 +161,65 @@ internal static class IconImage
         return best;
     }
 
-    /// <summary>Whether the font can draw this character, after upper-casing.</summary>
-    internal static bool Supports(char c) => Alphabet.IndexOf(char.ToUpperInvariant(c)) >= 0;
-
     /// <summary>
-    /// Everything in <paramref name="text"/> the font cannot draw, de-duplicated, so the tool can
-    /// warn about it instead of quietly leaving gaps.
-    /// </summary>
-    internal static string Unsupported(string? text) =>
-        text is null ? "" : new string(text.Where(c => !Supports(c)).Distinct().ToArray());
-
-    /// <summary>
-    /// A 32x32 PNG: 1 px border, a coloured banner across the top carrying
-    /// <paramref name="line1"/> in <paramref name="bannerText"/>, and up to two more lines below
-    /// it on <paramref name="background"/>. Lines longer than <see cref="MaxCharsPerLine"/> are
-    /// truncated - the caller is expected to have warned already.
+    /// A 32x32 PNG in the icon editor's layout: 1 px frame, a coloured banner carrying
+    /// <paramref name="line1"/> in <paramref name="bannerText"/>, a separator line in
+    /// <paramref name="border"/>, and <paramref name="line2"/>, <paramref name="line3"/> and
+    /// <paramref name="line4"/> as up to three body lines on <paramref name="background"/>. Empty
+    /// body lines are skipped, and the rest are spaced for how many remain. A line wider than
+    /// <see cref="MaxLineWidth"/> is cut to <see cref="Fit"/> - the caller is expected to have
+    /// warned already. line4 is last and optional so that callers written for two body lines keep
+    /// compiling and drawing what they drew.
     /// </summary>
     internal static byte[] Render(
         string? line1, string? line2, string? line3,
-        Rgb banner, Rgb background, Rgb border, Rgb bannerText, Rgb bodyText)
+        Rgb banner, Rgb background, Rgb border, Rgb bannerText, Rgb bodyText,
+        string? line4 = null)
     {
         var pixels = new Rgb[Size * Size];
         Array.Fill(pixels, background);
 
-        // Banner rows 1..9: nine rows is a 7 px glyph with a pixel of air above and below.
-        for (var y = 1; y <= 9; y++)
+        // Banner rows 1..10: the font's six rows (caps plus descender) with air above and below.
+        for (var y = 1; y <= BannerBottom; y++)
             for (var x = 1; x < Size - 1; x++)
                 pixels[y * Size + x] = banner;
 
-        // Border last would be wrong only if the banner overwrote it; it does not, but drawing
-        // the frame after the fill keeps the corners exact whatever the fill does later.
+        // Frame and separator after the fills, so the corners stay exact whatever the fills do.
         for (var i = 0; i < Size; i++)
         {
-            pixels[i] = border;                          // top
-            pixels[(Size - 1) * Size + i] = border;      // bottom
-            pixels[i * Size] = border;                   // left
-            pixels[i * Size + Size - 1] = border;        // right
+            pixels[i] = border;                              // top
+            pixels[(BannerBottom + 1) * Size + i] = border;  // separator under the banner
+            pixels[(Size - 1) * Size + i] = border;          // bottom
+            pixels[i * Size] = border;                       // left
+            pixels[i * Size + Size - 1] = border;            // right
         }
 
-        DrawLine(pixels, line1, 2, bannerText);
-        DrawLine(pixels, line2, 12, bodyText);
-        DrawLine(pixels, line3, 21, bodyText);
+        DrawLine(pixels, line1, BannerTop, bannerText);
+
+        var body = new[] { line2, line3, line4 }.Where(l => !string.IsNullOrWhiteSpace(l)).ToArray();
+        for (var i = 0; i < body.Length; i++)
+            DrawLine(pixels, body[i], BodyTops[body.Length][i], bodyText);
 
         return Encode(pixels);
     }
 
-    /// <summary>Draw one centred line with its top row at <paramref name="top"/>.</summary>
+    /// <summary>Draw one line centred on its ink, with its cap top at row <paramref name="top"/>.</summary>
     private static void DrawLine(Rgb[] pixels, string? text, int top, Rgb colour)
     {
-        if (string.IsNullOrWhiteSpace(text)) return;
+        var layout = Layout(Fit(text));
+        if (layout.Width == 0) return;
 
-        var chars = text.Trim().ToUpperInvariant();
-        if (chars.Length > MaxCharsPerLine) chars = chars[..MaxCharsPerLine];
-
-        var width = chars.Length * (GlyphWidth + 1) - 1;
-        var x0 = (Size - width) / 2;
-
-        for (var i = 0; i < chars.Length; i++)
-        {
-            var index = Alphabet.IndexOf(chars[i]);
-            if (index < 0) continue;                      // reported by Unsupported(), not drawn
-
-            for (var row = 0; row < GlyphHeight; row++)
-            {
-                var bits = GlyphRows[index * GlyphHeight + row];
-                for (var col = 0; col < GlyphWidth; col++)
+        var x0 = (Size - layout.Width) / 2 - layout.InkLeft;
+        foreach (var (cellX, rows) in layout.Cells)
+            for (var row = 0; row < rows.Length; row++)
+                for (var col = 0; col < rows[row].Length; col++)
                 {
-                    if ((bits & (1 << (GlyphWidth - 1 - col))) == 0) continue;
-                    var x = x0 + i * (GlyphWidth + 1) + col;
+                    if (rows[row][col] != '#') continue;
+                    var x = x0 + cellX + col;
                     var y = top + row;
                     if (x > 0 && x < Size - 1 && y > 0 && y < Size - 1)
                         pixels[y * Size + x] = colour;
                 }
-            }
-        }
     }
 
     /// <summary>

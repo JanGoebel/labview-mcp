@@ -23,16 +23,31 @@ public sealed class DefaultIconTests : IDisposable
 
     [Theory]
     [InlineData(@"C:\x\Main.vi", "Plain", null, "MAIN", null, null)]
-    [InlineData(@"C:\x\Test TDMS Logger.vi", "Plain", null, "TEST", "TDMS", "LGGR")]
-    [InlineData(@"C:\x\Run TDMS Logger Tests.vi", "Plain", null, "RUN", "TDMS", "LGGR")]
-    [InlineData(@"C:\x\Write Sample.vi", "ClassMember", @"C:\x\TDMS Logger.lvclass", "TDMS", "WRITE", "SMPL")]
+    [InlineData(@"C:\x\Test TDMS Logger.vi", "Plain", null, "TEST", "TDMS", "LOGGER")]
+    [InlineData(@"C:\x\Run TDMS Logger Tests.vi", "Plain", null, "RUN", "TDMS", "LOGGER")]
+    [InlineData(@"C:\x\Write Sample.vi", "ClassMember", @"C:\x\TDMS Logger.lvclass", "TDMS", "WRITE", "SAMPLE")]
     [InlineData(@"C:\x\Read Channel Name.vi", "ClassMember", @"C:\x\TDMS Logger.lvclass", "TDMS", "READ", "CHNNL")]
     [InlineData(@"C:\x\Open.vi", "ClassMember", @"C:\x\IDataLogger.lvclass", "IDATA", "OPEN", null)]
-    [InlineData(@"C:\x\Methods.vi", "Test", @"C:\x\TDMS Logger.lvclass", "TEST", "TDMS", "LGGR")]
+    [InlineData(@"C:\x\Methods.vi", "Test", @"C:\x\TDMS Logger.lvclass", "TEST", "TDMS", "LOGGER")]
     public void Derive_takes_the_lines_from_the_names(string vi, string kind, string? owner,
                                                        string l1, string? l2, string? l3)
     {
         Assert.Equal((l1, l2, l3), DefaultIcon.Derive(vi, Enum.Parse<DefaultIcon.Kind>(kind), owner));
+    }
+
+    /// <summary>
+    /// Narrowed only as far as the 28 px line needs. Under the old five-character limit LOGGER
+    /// became LGGR and SAMPLE became SMPL, although both fit the icon whole (27 and 28 px).
+    /// </summary>
+    [Theory]
+    [InlineData("Logger", "LOGGER")]          // 27 px: whole
+    [InlineData("Sample", "SAMPLE")]          // 28 px, exactly the limit: whole
+    [InlineData("Channel", "CHNNL")]          // 32 px whole; 23 px without its vowels
+    [InlineData("IDataLogger", "IDTLGG")]     // still 29 px without vowels, so cut to fit
+    public void Abbreviate_narrows_a_word_only_as_far_as_the_icon_needs(string word, string line)
+    {
+        Assert.Equal(line, DefaultIcon.Abbreviate(word));
+        Assert.True(LabVIEWMcp.Infra.IconImage.Fits(line));
     }
 
     [Fact]
@@ -43,7 +58,7 @@ public sealed class DefaultIconTests : IDisposable
             var (a, b, c) = DefaultIcon.Derive(name + ".vi", DefaultIcon.Kind.Plain);
             foreach (var line in new[] { a, b, c }.OfType<string>())
             {
-                Assert.True(line.Length <= LabVIEWMcp.Infra.IconImage.MaxCharsPerLine, line);
+                Assert.True(LabVIEWMcp.Infra.IconImage.Fits(line), line);
                 Assert.Equal(line, line.ToUpperInvariant());
             }
         }
@@ -72,7 +87,7 @@ public sealed class DefaultIconTests : IDisposable
 
         Assert.True(step["ok"]!.GetValue<bool>());
         Assert.True(step["derived"]!.GetValue<bool>());
-        Assert.Equal(("TDMS", "WRITE", "SMPL"), seen);
+        Assert.Equal(("TDMS", "WRITE", "SAMPLE"), seen);
     }
 
     [Fact]
